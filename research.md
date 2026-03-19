@@ -366,329 +366,35 @@ I also ran a tiny 2-step random-weight sampling pass and confirmed the inference
 
 ## Specific Findings and Rough Edges
 
-### 1. README and script paths are inconsistent
+1. Critical Execution Crashers (Needs Immediate Fixes)
+These bugs will immediately crash the pipeline or result in completely invalid out-of-the-box behavior.
 
-Examples:
+CUDA Device Mismatch in Inference: During inference, gen_mask remains on the GPU because it is sliced directly from result. The code then mixes it with CPU tensors like torch.tensor(1.0) and background_mask. This will cause a device mismatch crash on the GPU.
 
-- README says `training_scripts`, but the repo directory is `traing_scripts`
-- README refers to commands like `train_MMWHSCT_full_all.sh` and `train_MMWHSMRI_full_all.sh`, which do not exist
-- README dataset section says TotalSegmentator uses `training_set` and `testing_set`, but the repo actually uses `train` and `test`
 
-### 2. The MMWHS MRI "all" training script points to a non-existent directory
+Broken map_location Checkpoint Loading: In Trainer.load, if map_location is provided, the code executes torch.load(milestone, map_location=map_location) instead of joining the milestone integer with the results_folder path. Passing an integer to torch.load will throw an error.
 
-`traing_scripts/train_MMWHSMRI_all.sh` uses:
+MMWHS MRI "All" Script Directory Mismatch: The script train_MMWHSMRI_all.sh points to ./data/MMWHS/MRI/training_all, but the data is instructed to be placed in ./data/MMWHS/MRI/all. The script will fail immediately due to a missing directory.
 
-- `dataset.root_dir=./data/MMWHS/MRI/training_all`
+2. Methodological & Metric Flaws
+These bugs allow the code to run but silently compromise the validity of the model's outputs and evaluation metrics.
 
-But the actual directory in this workspace is:
+Inference Ignores EMA Weights: Diffusion models heavily rely on Exponential Moving Average (EMA) weights for high-quality sampling. While Trainer.save correctly saves both model and ema, the inference script explicitly extracts and loads only ["model"].
 
-- `./data/MMWHS/MRI/all`
+Guidance Toggles and Unguided Sampling are Broken: The sampling loop condition if self.use_guide is not None: evaluates to True even if use_guide=False. Furthermore, if use_guide=None is explicitly passed, the lack of an else branch means the reverse diffusion loop does absolutely no denoising, returning the initial random noise.
 
-As written, that training script will fail.
+NSD Evaluation Ignores Real Voxel Spacing: The get_nsd metric is called without passing a spacing argument. This forces compute_surface_dice to fall back to the default (1.0, 1.0, 1.0) spacing. For anisotropic medical volumes, this will result in mathematically incorrect boundary metrics.
 
-### 3. Pretrained model download instructions are broken
+3. Silent Logic Bugs & Scheduling Errors
+These are underlying logical errors where the code behaves differently than its variables or configurations suggest.
 
-The README uses `wget -o ...`, which writes logs to a file rather than saving the downloaded payload to that filename.
+Trainer Off-By-One Errors: In Trainer.train, optimizer steps occur before the save and EMA conditions are checked, and self.step is only incremented at the very end of the loop. This causes checkpoints to lag by one update step, and explains why the training scripts must specify 10001 or 50001 steps to trigger the final save.
 
-Observed result in this workspace:
+Unused Reverse Diffusion Schedule Variables: The main p_sample_loop constructs a recurrent schedule array intended for RePaint-style scheduling, but never actually reads from it during the reverse process. 
 
-- `Model/DiffAtlas_MMWHS-CT_full/pretrained_MMWHSCT_full` is plain ASCII text
-- it contains a failed `wget` log, not a PyTorch checkpoint
+Inference RNG is Deliberately Discarded: At the end of every inference case, th.random.seed() and th.cuda.seed() are called without arguments, which reseeds the generators from entropy. This intentionally prevents reproducible evaluations.
 
-### 4. Pretrained filename conventions do not match the inference loader
+4. Repository Housekeeping & Data Asymmetries
+These points affect the readability and maintainability of the project.
 
-Inference expects:
-
-- `model_path/model-{model_num}.pt`
-
-The README examples download files named like:
-
-- `pretrained_MMWHSCT_full`
-
-Even if the download succeeded, inference would still look for:
-
-- `model-pretrained_MMWHSCT_full.pt`
-
-So the README/scripts and the actual loader naming convention do not line up.
-
-### 5. Inference loads raw model weights, not EMA weights
-
-Training checkpoints save both:
-
-- `model`
-- `ema`
-
-But inference explicitly loads `["model"]`, not `["ema"]`.
-
-That may be intentional, but it is atypical for diffusion projects, where EMA weights are often preferred at evaluation time.
-
-### 6. Guidance cannot really be disabled with `False`
-
-The sampling loops check:
-
-- `if self.use_guide is not None`
-
-So `False` still counts as "guided". Guidance is only skipped if `use_guide=None`.
-
-### 7. There is substantial dead or inherited code
-
-Unused or effectively dormant pieces include:
-
-- alternate sampling loops `p_sample_loop_v2/v3/v4`
-- `p_losses_image_only`
-- circle-mask helper methods in both datasets
-- text/BERT conditioning path
-- the MONAI `UNet` inference path
-
-This does not break the main workflow, but it makes the codebase look broader than it really is.
-
-### 8. NSD evaluation does not use real voxel spacing
-
-This can materially affect reported boundary metrics on anisotropic medical volumes.
-
-### 9. MMWHS SDFs are external prerequisites, TotalSegmentator SDFs are computed on demand
-
-This asymmetry is easy to miss and is one of the biggest practical data-specific assumptions in the repo.
-
-### 10. The project depends on aggressively standardized inputs
-
-The whole system assumes:
-
-- fixed `64^3` shape
-- fixed class set of five foreground labels
-- preprocessed and intensity-clamped inputs
-- one image channel only
-
-This is not a drop-in segmentation framework for arbitrary 3D medical datasets without substantial preprocessing adaptation.
-
-## Bug Audit: Scheduling and Control Flow
-
-This section focuses specifically on the scheduling flow the code uses at train time and inference time: reverse diffusion timestep flow, checkpoint cadence, EMA cadence, resume flow, and per-case evaluation control flow.
-
-### 11. The main reverse-diffusion "schedule" variables are computed and then ignored
-
-In the main sampling code and two alternate variants, the code constructs schedule scaffolding and never uses it:
-
-- `ddpm/diffusion.py:649-653`
-- `ddpm/diffusion.py:611-614`
-- `ddpm/diffusion.py:676-679`
-
-Examples:
-
-- `R = 2` or `R = 3` is assigned
-- `recurrent = [0] * self.num_timesteps` is built
-- selected entries are marked
-- the array is never read again
-
-Impact:
-
-- the reverse process is not actually using any recurrent/repaint-style timestep schedule
-- changing `R` has no effect
-- the presence of this code strongly suggests an intended schedule was started and never finished
-
-So the effective scheduler in the deployed path is just a plain monotonic `for`/`while` loop over timesteps.
-
-### 12. `p_sample_loop()` becomes a complete no-op if guidance is disabled with `None`
-
-The main inference path in `ddpm/diffusion.py:643-666` only performs denoising inside:
-
-- `if self.use_guide is not None:`
-
-There is no `else` branch. If `use_guide=None`, the loop simply decrements `i` until it exits and returns the original random initialization unchanged.
-
-I verified this locally with a minimal script: with a fixed seed, `p_sample_loop(..., use_guide=None)` returns exactly the same tensor as the initial concatenated random `img` and `mask` noise.
-
-Impact:
-
-- the "unguided" path is broken
-- there is no valid fallback reverse diffusion path in the main sampler
-- any caller trying to disable image guidance gets random noise back, not a sampled result
-
-### 13. `use_guide=False` still enables guidance
-
-The same condition:
-
-- `if self.use_guide is not None`
-
-means that `False` still counts as "guided". Only `None` disables guidance, but as described above, `None` breaks the loop entirely.
-
-I verified this locally:
-
-- `use_guide=False` does not return the initial random tensor
-- `use_guide=None` does
-
-Impact:
-
-- the guidance flag has misleading semantics
-- there is no clean, working way to toggle between guided and unguided sampling in the main sampler
-
-### 14. Guidance is applied every timestep because the unfinished schedule is ignored
-
-Because the recurrent schedule array is unused, `p_sample_loop()` overwrites the image channel with the target image's noisy version at every reverse timestep:
-
-- `ddpm/diffusion.py:657-662`
-
-Impact:
-
-- whatever more selective scheduling behavior the code seems to have been preparing for never happens
-- the practical behavior is "hard image replacement on every step", not any kind of sparse or recurrent schedule
-
-This is less a crash bug than an implementation bug: the code advertises a scheduling idea it does not actually execute.
-
-### 15. Checkpoint saving is off by one optimizer update
-
-The trainer's save condition is checked before incrementing `self.step`:
-
-- optimizer step happens first in `ddpm/diffusion.py:949-951`
-- save condition is checked using the old `self.step` in `ddpm/diffusion.py:953-960`
-- only after that does `self.step += 1` happen in `ddpm/diffusion.py:963`
-
-I verified this locally with a tiny mock model:
-
-- with `save_and_sample_every=2` and `train_num_steps=3`, the only saved file is `model-1.pt`
-- that checkpoint contains weights from the 3rd optimizer update, not the 2nd
-- its stored `step` field is `2`, even though the weights are already one update ahead
-
-Impact:
-
-- milestone filenames do not correspond to the actual number of completed optimizer updates
-- the `step` metadata written into checkpoints lags the saved weights by one update
-
-### 16. The shipped `10001` / `50001` training lengths are compensating for the save bug
-
-The off-by-one save logic also explains the odd script values:
-
-- MMWHS scripts use `model.train_num_steps=10001`
-- TotalSegmentator uses `model.train_num_steps=50001`
-
-I verified the behavior locally:
-
-- with `train_num_steps=2` and `save_and_sample_every=2`, no checkpoint is saved at all
-- with `train_num_steps=3` and `save_and_sample_every=2`, `model-1.pt` appears
-
-Impact:
-
-- you only get the expected "final" milestone if you run one extra optimizer step past the nominal target
-- the current scripts appear to be working around the broken scheduler rather than matching a clean definition of training length
-
-### 17. EMA starts averaging one update later than `step_start_ema` suggests
-
-EMA uses the same pre-increment `self.step` value:
-
-- `ddpm/diffusion.py:877-881`
-- `ddpm/diffusion.py:953-954`
-
-Because `step_ema()` is called after the optimizer update but before `self.step += 1`, true EMA averaging starts one update later than the variable name implies.
-
-I verified this with a tiny mock model and `step_start_ema=2`:
-
-- steps 0 and 1 reset EMA to current weights
-- actual averaging first occurs on the 3rd optimizer update
-
-Impact:
-
-- `step_start_ema` is effectively off by one update
-- EMA warmup behavior is not what the configuration name suggests
-
-### 18. `Trainer.load(..., map_location=...)` is broken
-
-In `ddpm/diffusion.py:893-905`, the load path splits incorrectly:
-
-- if `map_location` is not provided, it loads from `results_folder/model-{milestone}.pt`
-- if `map_location` is provided, it tries `torch.load(milestone, map_location=...)`
-
-That means the integer milestone is passed directly to `torch.load` instead of being turned into a file path.
-
-I verified this locally: calling `trainer.load(7, map_location='cpu')` raises an error because PyTorch receives the integer `7` instead of a checkpoint path.
-
-Impact:
-
-- cross-device resume/loading via `map_location` is broken
-- any code path that tries to load a numbered milestone onto CPU from GPU training will fail
-
-### 19. The CUDA inference path likely crashes when merging class masks
-
-In `test/inference.py:309-312`, the code mixes a likely GPU tensor with new CPU tensors:
-
-- `gen_mask` comes from `result`, which stays on `device`
-- `torch.tensor(1.0)` and `torch.tensor(0.0)` are created on CPU
-- `background_mask = torch.ones(...)` is also created on CPU
-
-Then the code performs:
-
-- `torch.where(gen_mask < 0.0, torch.tensor(1.0), torch.tensor(0.0))`
-- boolean indexing into `background_mask` using a mask derived from `gen_mask_de_sdf`
-
-On CPU this is fine. On CUDA this is a device mismatch waiting to happen.
-
-Impact:
-
-- the exact path used to build the merged categorical prediction is not device-safe
-- per-class output saving may work, but the "label-together-gen" branch is likely to fail on GPU inference
-
-### 20. Inference intentionally randomizes its RNG state after each case, making evaluation non-reproducible
-
-In `test/inference.py:258-264`, each case gets a random seed drawn from the current RNG state. Then at the end of the loop in `test/inference.py:332-335`, the script does:
-
-- `th.random.seed()`
-- `th.cuda.seed()`
-
-with no explicit seed value, which reseeds from entropy.
-
-Impact:
-
-- rerunning the same evaluation command does not produce a deterministic per-case seed schedule
-- even if a user sets a global seed before calling the script, the script deliberately discards deterministic RNG state between cases
-
-This is a reproducibility bug in the evaluation flow.
-
-### 21. Inference evaluates the non-EMA weights even though training maintains EMA
-
-Training saves both:
-
-- `model`
-- `ema`
-
-But inference explicitly extracts `["model"]` in `test/inference.py:217` and loads that into the diffusion object.
-
-Impact:
-
-- evaluation is not using the smoothed checkpoint that diffusion projects usually rely on
-- the code is maintaining an EMA schedule during training but not consuming it in the main test flow
-
-This is not a crash bug, but it is a workflow bug: the scheduled EMA maintenance is disconnected from the evaluation path that should benefit from it.
-
-## Bottom Line
-
-The repository implements a concrete and fairly specialized idea:
-
-- train a 3D diffusion denoiser over joint image and per-class SDF volumes
-- segment a target scan by anchoring the image channel to that scan throughout reverse diffusion
-- recover masks by thresholding generated SDF channels at zero
-
-Conceptually, the system is cleaner than the repo might first suggest. The actual working path is narrow:
-
-- two dataset loaders
-- one real backbone (`Unet3D`)
-- one diffusion objective
-- one image-guided sampling routine
-
-Most of the complexity outside that path is either borrowed infrastructure or unfinished generalization.
-
-The strongest implementation-specific takeaways are:
-
-- DiffAtlas in code is a guided joint diffusion segmenter, not an atlas retrieval system
-- SDF representation is central to both training and decoding
-- inference is hard-wired around repeated noisy-image replacement
-- the repo currently contains multiple reproducibility blockers in its docs, scripts, and scheduling/control flow
-
-If this project were to be extended or productionized, the first priorities would be:
-
-- fix checkpoint naming/download flow
-- fix the broken save/EMA scheduling order in `Trainer.train`
-- fix the main sampler so unguided sampling actually denoises
-- make the inference mask-merging path device-safe
-- fix script path mismatches
-- make spacing-aware metrics consistent
-- clarify the true data contract and preprocessing pipeline
-- remove or quarantine dormant code paths
+README Path and Naming Typos: The README refers to training_scripts, but the actual folder is traing_scripts. Additionally, inference expects checkpoints named model-{model_num}.pt, which does not align with the pretrained_MMWHSCT_full output filenames suggested in the README.

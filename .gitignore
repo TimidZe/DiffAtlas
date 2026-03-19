@@ -21,6 +21,7 @@ logs/
 checkpoints/
 results/
 fig/
+inference_visualization/
 Model/
 *.pth
 *.pt

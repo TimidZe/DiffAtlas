@@ -3,7 +3,6 @@ import torch
 from torch.utils.data.dataset import Dataset
 import os
 import glob
-import cv2
 import torchio as tio
 from torch.utils.data import DataLoader
 from sdf import compute_sdf
@@ -39,39 +38,6 @@ class TS_Dataset(Dataset):
         self.preprocessing_img = PREPROCESSING_TRANSORMS
         self.preprocessing_mask = PREPROCESSING_MASK_TRANSORMS
         self.mode = mode
-    
-    @staticmethod
-    def create_mask(shape):
-        return torch.zeros(shape, dtype=torch.uint8)
-    
-    @staticmethod 
-    def project_to_2d(mask):
-        projection = torch.max(mask, dim=0)[0]
-        return projection.numpy()
-
-    @staticmethod
-    def min_enclosing_circle(projection):
-
-        points = np.column_stack(np.where(projection > 0))
-        points = points.astype(np.float32)
-        print(points.shape)       
-        (x, y), radius = cv2.minEnclosingCircle(points.astype(np.float32))
-        center = (int(x), int(y))
-        radius = int(radius)
-        return center, radius
-
-    @staticmethod
-    def create_circle_mask_2d(shape, center, radius):
-        mask = np.zeros(shape, dtype=np.uint8)
-        cv2.circle(mask, center, radius, 1, thickness=-1)
-        return mask
-
-    @staticmethod
-    def apply_circle_mask_to_3d(mask, circle_mask_2d):
-        for i in range(mask.shape[0]):
-            mask[i] = torch.from_numpy(circle_mask_2d)
-        return mask
-    
 
     def train_transform(self, image, label, p):
         TRAIN_TRANSFORMS = tio.Compose([
@@ -107,7 +73,7 @@ class TS_Dataset(Dataset):
         
         affine = img.affine
         mask = mask.data
-        img = img.data
+        img = img.data.float()
 
         label_1 = (mask == 1).float()
         label_1_sdf = compute_sdf(label_1)
@@ -120,7 +86,13 @@ class TS_Dataset(Dataset):
         label_5 = (mask == 5).float()
         label_5_sdf = compute_sdf(label_5)
         label = torch.cat((label_1, label_2, label_3, label_4, label_5), dim=0)
-        label_sdf = torch.cat((torch.tensor(label_1_sdf), torch.tensor(label_2_sdf), torch.tensor(label_3_sdf), torch.tensor(label_4_sdf), torch.tensor(label_5_sdf)), dim=0)
+        label_sdf = torch.cat((
+            torch.tensor(label_1_sdf, dtype=torch.float32),
+            torch.tensor(label_2_sdf, dtype=torch.float32),
+            torch.tensor(label_3_sdf, dtype=torch.float32),
+            torch.tensor(label_4_sdf, dtype=torch.float32),
+            torch.tensor(label_5_sdf, dtype=torch.float32),
+        ), dim=0)
 
         return {
             'name': name,

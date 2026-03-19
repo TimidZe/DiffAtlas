@@ -1,8 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 python train/train.py \
     model=ddpm \
     dataset=MMWHS \
     dataset.data_type=MRI \
-    dataset.root_dir=./data/MMWHS/MRI/training_all \
+    dataset.root_dir=./data/MMWHS/MRI/all \
     dataset.mode=train \
     model.diffusion_img_size=64 \
     model.diffusion_depth_size=64 \
@@ -11,6 +14,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python train/train.py \
     model.results_folder=./Model/DiffAtlas_MMWHS-MRI_all \
     model.load_milestone=False \
     model.save_and_sample_every=100 \
-    model.train_num_steps=10001 \
+    model.train_num_steps=10000 \
     model.timesteps=300 \
-    model.num_workers=20 \
+    model.num_workers=20

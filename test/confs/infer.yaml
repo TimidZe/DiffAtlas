@@ -5,16 +5,18 @@ dim_mults: [1,2,4,8]
 denoising_fn: Unet3D
 timesteps: ???
 loss_type: l1 
+use_guide: true
 
 model_path: ???
 model_num: ???
+weight_key: ema
 dir_name: ???
 
 dataset: ???
 mode: ???
 data_type: ???
 root_dir: ???
-
-
-
-
+device: null
+seed: 1
+seed_num: 1
+deterministic: true

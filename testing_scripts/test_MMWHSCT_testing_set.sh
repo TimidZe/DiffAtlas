@@ -1,6 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 CUDA_VISIBLE_DEVICES=0 python test/inference.py \
     model_path=./Model/DiffAtlas_MMWHS-CT_full \
-    model_num=pretrained_MMWHSCT_full  \
+    model_num=pretrained_MMWHSCT_full \
     dataset=MMWHS \
     data_type=CT \
     mode=test \
@@ -8,5 +11,5 @@ CUDA_VISIBLE_DEVICES=0 python test/inference.py \
     diffusion_depth_size=64 \
     diffusion_num_channels=6 \
     timesteps=300 \
-    dir_name=TS \
+    dir_name=MMWHSCT_testing_set \
     root_dir=./data/MMWHS/CT/testing_set

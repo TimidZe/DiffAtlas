@@ -3,6 +3,7 @@ import io
 import blobfile as bf
 import torch as th
 import sys
+from pathlib import Path
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, parent_dir)
 from ddpm import Unet3D, GaussianDiffusion_Nolatent
@@ -32,6 +33,41 @@ def load_state_dict(path, backend=None, **kwargs):
     with bf.BlobFile(path, "rb") as f:
         data = f.read()
     return th.load(io.BytesIO(data), **kwargs)
+
+
+def resolve_checkpoint_path(model_path, model_num):
+    model_path = Path(os.path.expanduser(str(model_path)))
+    if model_path.is_file():
+        return model_path
+    return model_path / f"model-{model_num}.pt"
+
+
+def strip_module_prefix(state_dict):
+    weights_dict = {}
+    for key, value in state_dict.items():
+        weights_dict[key.replace('module.', '')] = value
+    return weights_dict
+
+
+def set_seed(seed, deterministic=True):
+    if seed is None:
+        return
+
+    th.manual_seed(seed)
+    np.random.seed(seed)
+
+    if th.cuda.is_available():
+        th.cuda.manual_seed(seed)
+        th.cuda.manual_seed_all(seed)
+
+    th.backends.cudnn.deterministic = deterministic
+    th.backends.cudnn.benchmark = not deterministic
+
+
+def build_case_seed(base_seed, case_index, trial_index, seed_num):
+    if base_seed is None:
+        return None
+    return int(base_seed) + case_index * seed_num + trial_index
 
 try:
     import ctypes
@@ -171,12 +207,14 @@ class Tee:
     
     def write(self, obj):
         for f in self.files:
-            f.write(obj)
-            f.flush()  
+            if not f.closed:
+                f.write(obj)
+                f.flush()  
     
     def flush(self):
         for f in self.files:
-            f.flush()
+            if not f.closed:
+                f.flush()
 
 
 @hydra.main(config_path='confs', config_name='infer', version_base=None)
@@ -209,17 +247,18 @@ def main(conf: DictConfig):
         channels=conf.diffusion_num_channels,
         timesteps=conf.timesteps,
         loss_type=conf.loss_type,
+        use_guide=conf.use_guide,
     )
     diffusion.to(device)
 
-    model_path = os.path.join(conf.model_path, f"model-{conf.model_num}.pt")
-    weights_dict = {}
-    for k, v in (load_state_dict(os.path.expanduser(model_path), map_location="cpu")["model"].items()):
-        new_k = k.replace('module.', '') if 'module' in k else k
-        weights_dict[new_k] = v
-
+    checkpoint_path = resolve_checkpoint_path(conf.model_path, conf.model_num)
+    checkpoint = load_state_dict(os.path.expanduser(str(checkpoint_path)), map_location="cpu")
+    if conf.weight_key not in checkpoint:
+        raise KeyError(f"Checkpoint {checkpoint_path} does not contain weight key '{conf.weight_key}'")
+    weights_dict = strip_module_prefix(checkpoint[conf.weight_key])
     diffusion.load_state_dict(weights_dict)
 
+    diffusion.eval()
     model.eval()
 
     print("sampling...")
@@ -234,12 +273,18 @@ def main(conf: DictConfig):
     idx = 0
     dice_total = [0, 0, 0, 0, 0]
     nsd_total = [0, 0, 0, 0, 0]
+    seed_num = conf.seed_num
+    set_seed(conf.seed, deterministic=conf.deterministic)
     for batch in iter(dataloader):
         idx += 1
         for k in batch.keys():
+            if k == 'affine':
+                continue
             if isinstance(batch[k], th.Tensor):
                 batch[k] = batch[k].to(device)
-                affine = batch['affine'].squeeze(0).cpu()
+                if th.is_floating_point(batch[k]):
+                    batch[k] = batch[k].float()
+        affine = torch.as_tensor(batch['affine']).squeeze(0).cpu()
 
         real_image = batch["img"]
         real_mask = batch.get('mask').cpu()
@@ -253,15 +298,10 @@ def main(conf: DictConfig):
 
         dice = [0, 0, 0, 0, 0]
         nsd = [0, 0, 0, 0, 0]
-        seed_num = 1
-        for _ in range(seed_num):
-            seed = th.randint(0, 10000, (1,)).item()
+        for trial_index in range(seed_num):
+            seed = build_case_seed(conf.seed, idx - 1, trial_index, seed_num)
             print("     seed:", seed)
-            th.manual_seed(seed)
-            th.cuda.manual_seed(seed)
-            th.cuda.manual_seed_all(seed)
-            th.backends.cudnn.deterministic = True
-            th.backends.cudnn.benchmark = False
+            set_seed(seed, deterministic=conf.deterministic)
 
             sample_fn = diffusion.p_sample_loop
 
@@ -272,24 +312,23 @@ def main(conf: DictConfig):
                 image=real_image,
             )
 
-            gen_image = result[:,0,:,:,:]
-            gen_image = gen_image.cpu()
             gen_mask = result[:,1:(result.size()[1]),:,:,:]
+            gen_mask_de_sdf = (gen_mask < 0.0).to(dtype=gen_mask.dtype)
 
             real_img_to_save = tio.ScalarImage(tensor=real_image.squeeze(0).cpu(), channels_last=False, affine=affine)
             os.makedirs(os.path.join(vis_dir_name, 'Image'), exist_ok=True)
             real_img_to_save.save(os.path.join(vis_dir_name, 'Image', f"{gt_name}-image-real.nii.gz"))
             
             for i in range(gen_mask.size()[1]):
-                gen_mask_i = gen_mask[:,i,:,:,:]
-                gen_mask_i = gen_mask_i.cpu()
-                gen_mask_i_de_sdf = torch.where(gen_mask_i < 0.0, torch.tensor(1.0), torch.tensor(0.0))
+                gen_mask_i = gen_mask[:, i:i + 1, :, :, :]
+                gen_mask_i_cpu = gen_mask_i.cpu()
+                gen_mask_i_de_sdf = gen_mask_de_sdf[:, i:i + 1, :, :, :].cpu()
                 
-                gen_mask_sdf_to_save = tio.LabelMap(tensor=gen_mask_i, channels_last=False, affine=affine)
+                gen_mask_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_cpu.squeeze(1), channels_last=False, affine=affine)
                 os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
                 gen_mask_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-sdf-{i+1}-gen.nii.gz"))
                 
-                gen_mask_de_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_de_sdf, channels_last=False, affine=affine)
+                gen_mask_de_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_de_sdf.squeeze(1), channels_last=False, affine=affine)
                 os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
                 gen_mask_de_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-de-sdf-{i+1}-gen.nii.gz"))
 
@@ -301,38 +340,27 @@ def main(conf: DictConfig):
                 os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
                 real_mask_de_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-de-sdf-{i+1}-real.nii.gz"))
 
-                real_mask_i = real_mask[:,i,:,:,:]
+                real_mask_i = real_mask[:, i:i + 1, :, :, :]
                 Dice = get_dice(real_mask_i.numpy(), gen_mask_i_de_sdf.numpy())
                 print(f"        {i+1}_dice:", Dice)
                 dice[i] += Dice
             
-            gen_mask_de_sdf = torch.where(gen_mask < 0.0, torch.tensor(1.0), torch.tensor(0.0))
-            background_mask = torch.ones((1, 1, 64, 64, 64), dtype=torch.float16)
-            background_mask[0, 0, gen_mask_de_sdf[0].sum(dim=0) > 0] = 0  
-            gen_mask_togather = torch.cat((background_mask.cpu(), gen_mask_de_sdf.cpu()), dim=1) 
-            gen_mask_togather = gen_mask_togather.squeeze(0)
-            gen_mask_togather = torch.argmax(gen_mask_togather, dim=0) 
-            gen_mask_togather=gen_mask_togather.unsqueeze(0)
+            background_mask = (gen_mask_de_sdf.sum(dim=1, keepdim=True) == 0).to(dtype=gen_mask_de_sdf.dtype)
+            gen_mask_togather = torch.cat((background_mask, gen_mask_de_sdf), dim=1)
+            gen_mask_togather = torch.argmax(gen_mask_togather, dim=1)
             gen_mask_togather_to_save = tio.LabelMap(tensor=gen_mask_togather.cpu().int(), channels_last=False, affine=affine)
             os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
             gen_mask_togather_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-together-gen.nii.gz"))
 
             get_nsd = NSDMetric(n_classes=6)
             real_mask_togather = real_mask
-            background_mask = torch.ones((1, 1, 64, 64, 64), dtype=torch.float16)
-            background_mask[0, 0, real_mask_togather[0].sum(dim=0) > 0] = 0  
-            real_mask_togather_ = torch.cat((background_mask.cpu(),real_mask_togather.cpu()), dim=1) 
-            real_mask_togather_ = real_mask_togather_.squeeze(0)
-            real_mask_togather_ = torch.argmax(real_mask_togather_, dim=0) 
-            nnsd = get_nsd(inputs=gen_mask_togather.long(), target=real_mask_togather_.unsqueeze(0).long())
+            background_mask = (real_mask_togather.sum(dim=1, keepdim=True) == 0).to(dtype=real_mask_togather.dtype)
+            real_mask_togather_ = torch.cat((background_mask, real_mask_togather), dim=1)
+            real_mask_togather_ = torch.argmax(real_mask_togather_, dim=1)
+            nnsd = get_nsd(inputs=gen_mask_togather.long().cpu(), target=real_mask_togather_.long().cpu())
             for i in range(0, 5):
                 nsd[i] += nnsd[i]
             print(f"        {nnsd}")
-
-            th.random.seed() 
-            th.cuda.seed()  
-            th.backends.cudnn.deterministic = False
-            th.backends.cudnn.benchmark = True
 
         dice_avg = [item / seed_num for item in dice]
         nsd_avg = [item / seed_num for item in nsd]

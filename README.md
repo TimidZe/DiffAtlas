@@ -112,15 +112,20 @@ Accurate medical image segmentation is crucial for precise anatomical delineatio
 
 You can download the entire dataset or only part of it according to your needs. It is worth noting that in MMWHS/CT and MMWHS/MRI, `all` actually equals the sum of all the data in `testing_set` and `training_set_full`. The reason for listing “all” separately is to facilitate cross-domain training and testing.
 
+Data contract:
+
+- MMWHS samples must include `*-image.nii.gz`, `*-label.nii.gz`, and precomputed `*-sdf.nii.gz` files in the same folder.
+- TotalSegmentator samples only require image and label volumes; SDFs are generated online during loading.
+
 ## 🏃 Train DiffAtlas Model
 
-The training scripts are all stored in the `training_scripts` folder, and the specific training methods are as follows:
+The training scripts are stored in the `traing_scripts` folder.
 
 - Train on all training data of MMWHS-CT
 
   ```
   cd DiffAtlas
-  chmod +X ./traing_scripts/train_MMWHSCT_full_training_set.sh
+  chmod +x ./traing_scripts/train_MMWHSCT_full_training_set.sh
   ./traing_scripts/train_MMWHSCT_full_training_set.sh
   ```
 
@@ -128,15 +133,15 @@ The training scripts are all stored in the `training_scripts` folder, and the sp
 
   ```
   cd DiffAtlas
-  chmod +X ./traing_scripts/train_MMWHSCT_all.sh
-  ./traing_scripts/train_MMWHSCT_full_all.sh
+  chmod +x ./traing_scripts/train_MMWHSCT_all.sh
+  ./traing_scripts/train_MMWHSCT_all.sh
   ```
 
 - Train on all training data of MMWHS-MRI
 
   ```
   cd DiffAtlas
-  chmod +X ./traing_scripts/train_MMWHSMRI_full_training_set.sh
+  chmod +x ./traing_scripts/train_MMWHSMRI_full_training_set.sh
   ./traing_scripts/train_MMWHSMRI_full_training_set.sh
   ```
 
@@ -144,23 +149,27 @@ The training scripts are all stored in the `training_scripts` folder, and the sp
 
   ```
   cd DiffAtlas
-  chmod +X ./traing_scripts/train_MMWHSMRI_all.sh
-  ./traing_scripts/train_MMWHSMRI_full_all.sh
+  chmod +x ./traing_scripts/train_MMWHSMRI_all.sh
+  ./traing_scripts/train_MMWHSMRI_all.sh
   ```
 
 - Train on all training data of TotalSegmentator
 
   ```
   cd DiffAtlas
-  chmod +X ./traing_scripts/train_TotalSegmentator.sh
+  chmod +x ./traing_scripts/train_TotalSegmentator.sh
   ./traing_scripts/train_TotalSegmentator.sh
   ```
 
 ## 🎯 Evaluation
 
-We have provided pre-trained model weights under different training settings, which you can obtain from [HuggingFace🤗](https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model). All the testing scripts are stored in the `testing_scripts` folder. You can use them to test the training results.
+We have provided pre-trained model weights under different training settings, which you can obtain from [HuggingFace🤗](https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model). All testing entry points are stored in the `testing_scripts` folder.
 
-**Note:** If you want to perform inference with your own trained results, please modify the `model_num` parameter in the script to the specified weights and skip the steps below for downloading the pretrained weights.
+**Note:** If you want to perform inference with your own trained results, set `model_path` to the checkpoint directory and `model_num` to the saved milestone number so inference resolves `model-{model_num}.pt`.
+
+**Note:** Inference now loads EMA weights by default. Set `weight_key=model` only if you intentionally want raw training weights for debugging.
+
+**Note:** In the current Hugging Face release, the checkpoints trained on the full training split are published as `*_normal.pt`. Save them locally using the filenames below so they match the existing testing scripts.
 
 - Train on all training data of MMWHS-CT, and test on the training set of MMWHS-CT
 
@@ -172,15 +181,15 @@ We have provided pre-trained model weights under different training settings, wh
   cd Model
   mkdir -p DiffAtlas_MMWHS-CT_full
   cd DiffAtlas_MMWHS-CT_full
-  wget -o pretrained_MMWHSCT_full https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSCT_full.pt
+  wget -O model-pretrained_MMWHSCT_full.pt https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSCT_normal.pt
   ```
 
   start inference :
 
   ```
   cd DiffAtlas
-  chmod +x ./testing_scripts/test_MMWHSCT_testing_set
-  ./testing_scripts/test_MMWHSCT_all_testing_set
+  chmod +x ./testing_scripts/test_MMWHSCT_testing_set.sh
+  ./testing_scripts/test_MMWHSCT_testing_set.sh
   ```
 
 - Train on all data of MMWHS-CT, and test on all data of MMWHS-MRI
@@ -193,15 +202,15 @@ We have provided pre-trained model weights under different training settings, wh
   cd Model
   mkdir -p DiffAtlas_MMWHS-CT_all
   cd DiffAtlas_MMWHS-CT_all
-  wget -o pretrained_MMWHSCT_all https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSCT_all.pt
+  wget -O model-pretrained_MMWHSCT_all.pt https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSCT_all.pt
   ```
 
   start inference :
 
   ```
   cd DiffAtlas
-  chmod +x ./testing_scripts/test_MMWHSMRI_all
-  ./testing_scripts/test_MMWHSMRI_all
+  chmod +x ./testing_scripts/test_MMWHSMRI_all.sh
+  ./testing_scripts/test_MMWHSMRI_all.sh
   ```
 
 - Train on all training data of MMWHS-MRI, and test on the training set of MMWHS-MRI
@@ -214,15 +223,15 @@ We have provided pre-trained model weights under different training settings, wh
   cd Model
   mkdir -p DiffAtlas_MMWHS-MRI_full
   cd DiffAtlas_MMWHS-MRI_full
-  wget -o pretrained_MMWHSMRI_full https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSMRI_full.pt
+  wget -O model-pretrained_MMWHSMRI_full.pt https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSMRI_normal.pt
   ```
 
   start inference :
 
   ```
   cd DiffAtlas
-  chmod +x ./testing_scripts/test_MMWHSMRI_testing_set
-  ./testing_scripts/test_MMWHSMRI_all_testing_set
+  chmod +x ./testing_scripts/test_MMWHSMRI_testing_set.sh
+  ./testing_scripts/test_MMWHSMRI_testing_set.sh
   ```
 
 - Train on all data of MMWHS-MRI, and test on all data of MMWHS-CT
@@ -235,15 +244,15 @@ We have provided pre-trained model weights under different training settings, wh
   cd Model
   mkdir -p DiffAtlas_MMWHS-MRI_all
   cd DiffAtlas_MMWHS-MRI_all
-  wget -o pretrained_MMWHSMRI_all https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSMRI_all.pt
+  wget -O model-pretrained_MMWHSMRI_all.pt https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/MMWHSMRI_all.pt
   ```
 
   start inference :
 
   ```
   cd DiffAtlas
-  chmod +x ./testing_scripts/test_MMWHSCT_all
-  ./testing_scripts/test_MMWHSCT_all
+  chmod +x ./testing_scripts/test_MMWHSCT_all.sh
+  ./testing_scripts/test_MMWHSCT_all.sh
   ```
 
 - Train on all training data of TotalSegmentator, and test on the test data of TotalSegmentator
@@ -251,20 +260,16 @@ We have provided pre-trained model weights under different training settings, wh
   get pretrained model :
 
   ```
-  cd DiffAtlas
-  mkdir -p Model
-  cd Model
-  mkdir -p DiffAtlas_TotalSegmentator
-  cd DiffAtlas_TotalSegmentator
-  wget -o pretrained_TotalSegmentator_for_TotalSegmentatorTest https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/TotalSegmentator_for_TotalSegmentatorTest .pt
+  The current Hugging Face repository does not provide a released TotalSegmentator checkpoint yet.
+  Please train this setting locally before running the script below.
   ```
 
   start inference :
 
   ```
   cd DiffAtlas
-  chmod +x ./testing_scripts/test_TotalSegmentator
-  ./testing_scripts/test_TotalSegmentator
+  chmod +x ./testing_scripts/test_TotalSegmentator.sh
+  ./testing_scripts/test_TotalSegmentator.sh
   ```
 
 - Train on all training data of TotalSegmentator, and test on all data of MMWHS-MRI
@@ -272,20 +277,16 @@ We have provided pre-trained model weights under different training settings, wh
   get pretrained model :
 
   ```
-  cd DiffAtlas
-  mkdir -p Model
-  cd Model
-  mkdir -p DiffAtlas_TotalSegmentator
-  cd DiffAtlas_TotalSegmentator
-  wget -o pretrained_TotalSegmentator_for_MMWHSMRITest https://huggingface.co/YuheLiuu/DiffAtlas_Pretrained_model/resolve/main/TotalSegmentator_for_MMWHSMRITest.pt
+  The current Hugging Face repository does not provide a released TotalSegmentator checkpoint yet.
+  Please train this setting locally before running the script below.
   ```
 
   start inference :
 
   ```
   cd DiffAtlas
-  chmod +x ./testing_scripts/test_MMWHSMRI_all_train_TotalSegmentator
-  ./testing_scripts/test_MMWHSMRI_all_train_TotalSegmentator
+  chmod +x ./testing_scripts/test_MMWHSMRI_all_train_TotalSegmentator.sh
+  ./testing_scripts/test_MMWHSMRI_all_train_TotalSegmentator.sh
   ```
 
 ## 🙏 Acknowledgement

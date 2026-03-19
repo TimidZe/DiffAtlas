@@ -4,7 +4,6 @@ import torch
 from torch.utils.data.dataset import Dataset
 
 import glob
-import cv2
 import torchio as tio
 from torch.utils.data import DataLoader
 
@@ -35,38 +34,6 @@ class MMWHS_Dataset(Dataset):
         self.preprocessing_img_mri = PREPROCESSING_TRANSORMS_MRI
         self.preprocessing_mask = PREPROCESSING_MASK_TRANSORMS
     
-    @staticmethod
-    def create_mask(shape):
-        return torch.zeros(shape, dtype=torch.uint8)
-
-    @staticmethod 
-    def project_to_2d(mask):
-        projection = torch.max(mask, dim=0)[0]
-        return projection.numpy()
-
-    @staticmethod
-    def min_enclosing_circle(projection):
-
-        points = np.column_stack(np.where(projection > 0))
-        points = points.astype(np.float32)
-        print(points.shape)       
-        (x, y), radius = cv2.minEnclosingCircle(points.astype(np.float32))
-        center = (int(x), int(y))
-        radius = int(radius)
-        return center, radius
-
-    @staticmethod
-    def create_circle_mask_2d(shape, center, radius):
-        mask = np.zeros(shape, dtype=np.uint8)
-        cv2.circle(mask, center, radius, 1, thickness=-1)
-        return mask
-
-    @staticmethod
-    def apply_circle_mask_to_3d(mask, circle_mask_2d):
-        for i in range(mask.shape[0]):
-            mask[i] = torch.from_numpy(circle_mask_2d)
-        return mask
-    
     def train_transform(self, image, label, sdf, p):
         TRAIN_TRANSFORMS = tio.Compose([
             tio.RandomFlip(axes=(1), flip_probability=p),
@@ -87,6 +54,10 @@ class MMWHS_Dataset(Dataset):
         img_path = self.file_names[index]
         mask_path = img_path.replace("image.nii.gz", "label.nii.gz")
         sdf_path = img_path.replace("image.nii.gz", "sdf.nii.gz")
+        if not os.path.exists(sdf_path):
+            raise FileNotFoundError(
+                f"Expected precomputed MMWHS SDF file next to the image: {sdf_path}"
+            )
 
         img = tio.ScalarImage(img_path)
         mask = tio.LabelMap(mask_path) 
@@ -108,8 +79,8 @@ class MMWHS_Dataset(Dataset):
         
         affine = img.affine
         mask = mask.data
-        img = img.data
-        sdf = sdf.data
+        img = img.data.float()
+        sdf = sdf.data.float()
 
         label_1 = (mask == 1).float()
         label_2 = (mask == 2).float()
@@ -140,4 +111,3 @@ def get_MMWHS_dataloader(root_dir, data_type, mode, batch_size=1, drop_last=Fals
         dataset, batch_size=batch_size, shuffle=shuffle, num_workers=20, pin_memory=True, drop_last=drop_last
     )
     return loader
-

@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 python train/train.py \
     model=ddpm \
     dataset=MMWHS \
@@ -11,7 +14,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 python train/train.py \
     model.results_folder=./Model/DiffAtlas_MMWHS-CT_all \
     model.load_milestone=False \
     model.save_and_sample_every=100 \
-    model.train_num_steps=10001 \
+    model.train_num_steps=10000 \
     model.timesteps=300 \
-    model.num_workers=20 \
-
+    model.num_workers=20

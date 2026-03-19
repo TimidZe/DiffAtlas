@@ -496,6 +496,10 @@ class GaussianDiffusion_Nolatent(nn.Module):
         self.num_timesteps = int(timesteps)
         print("timesteps : ", timesteps)
         self.loss_type = loss_type
+        if use_guide is None:
+            use_guide = False
+        elif not isinstance(use_guide, bool):
+            raise TypeError('use_guide must be a boolean value')
         self.use_guide = use_guide
 
 
@@ -579,15 +583,6 @@ class GaussianDiffusion_Nolatent(nn.Module):
             x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
 
-    def p_sample_v2(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
-        b, *_ = x.shape
-        model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale)
-        noise = torch.randn_like(x)
-        nonzero_mask = (1 - (t == 0).float()).reshape(b,
-                                                      *((1,) * (len(x.shape) - 1)))
-        return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
-    
     @torch.inference_mode()
     def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
         b, *_ = x.shape
@@ -598,46 +593,11 @@ class GaussianDiffusion_Nolatent(nn.Module):
                                                       *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
     
-    def p_sample_loop_v2(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
-        b = shape_image[0]
-        img = torch.randn(shape_image, device=device)
-        mask = torch.randn(shape_mask, device=device)
-        input = torch.cat((img, mask), dim=1)
-        real_img = image
-        input_guided = input
-        N = 2 
-        R = 3
-        B = 1
-        recurrent = [0] * self.num_timesteps
-        for i in range(self.num_timesteps):
-            if i % R == 0:
-                recurrent[i] = R
-        i = self.num_timesteps - 1
-        while i >= 0:
-            if self.use_guide is not None and i < 250:
-                input_with_grad = input_guided.clone().detach().requires_grad_(True)
-                loss = 0
-                t = torch.full((b,), i, dtype=torch.long, device=device)
-                real_noisy_image = self.q_sample(x_start=real_img, t=t)
-                for _ in range(N):
-                    input_sampled = input_with_grad
-                    input_sampled = self.p_sample_v2(input_sampled, torch.full(
-                        (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
-                    loss+=F.mse_loss(torch.split(input_sampled, 1, dim=1)[0], real_noisy_image)
-                loss /= N
-                loss.backward()
-                update = torch.clamp(input_with_grad.grad * 10000.0, -1.5, 1.5)
-                input_guided[:, 0, :, :, :] = input_guided[:, 0, :, :, :] - update[:, 0, :, :, :]
-                input_with_grad.grad.zero_()
-            
-
-            with torch.no_grad():
-                    input_guided = self.p_sample_v2(input_guided, torch.full(
-                    (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
-            
-            i -= 1
-        
-        return input_guided 
+    def _apply_guidance(self, sample, real_img, t):
+        real_noisy_image = self.q_sample(x_start=real_img, t=t)
+        sample = sample.clone()
+        sample[:, :1, :, :, :] = real_noisy_image[:, :1, :, :, :]
+        return sample
     
     @torch.inference_mode()
     def p_sample_loop(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
@@ -646,81 +606,20 @@ class GaussianDiffusion_Nolatent(nn.Module):
         mask = torch.randn(shape_mask, device=device)
         input = torch.cat((img, mask), dim=1)
         real_img = image
-        R = 2
-        recurrent = [0] * self.num_timesteps
-        for i in range(self.num_timesteps):
-            if i % R == 0:
-                recurrent[i] = R
-        
-        i = self.num_timesteps - 1
-        while i >= 0:
-            if self.use_guide is not None:
-                t = torch.full((b,), i, dtype=torch.long, device=device)
-                real_noisy_image = self.q_sample(x_start=real_img, t=t)
-                input[:, 0, :, :, :] = real_noisy_image[:, 0, :, :, :].clone()
-                input = self.p_sample(input, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
-
-            i -= 1
-        
-        return input
-
-    @torch.inference_mode()
-    def p_sample_loop_v4(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
-        b = shape_image[0]
-        img = torch.randn(shape_image, device=device)
-        mask = torch.randn(shape_mask, device=device)
-        input = torch.cat((img, mask), dim=1)
-        real_img = image
-        R = 2
-        recurrent = [0] * self.num_timesteps
-        for i in range(self.num_timesteps):
-            if i % R == 0:
-                recurrent[i] = R
-        
-        i = self.num_timesteps - 1
-        while i >= 0:
-            print(i)
-            if self.use_guide is not None and i > 100:
-                t = torch.full((b,), i, dtype=torch.long, device=device)
-                real_noisy_image = self.q_sample(x_start=real_img, t=t)
-                input[:, 0, :, :, :] = real_noisy_image[:, 0, :, :, :].clone()
-                input = self.p_sample(input, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
-            else:
-                input = self.p_sample(input, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
-
-            i -= 1
-        
-        return input
-    
-
-    @torch.inference_mode()
-    def p_sample_loop_v3(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
-        b = shape_image[0]
-        img = torch.randn(shape_image, device=device)
-        mask = torch.randn(shape_mask, device=device)
-        input = torch.cat((img, mask), dim=1)
+        if self.use_guide and real_img is None:
+            raise ValueError('Guided sampling requires a real input image')
 
         i = self.num_timesteps - 1
         while i >= 0:
-            input = self.p_sample(input, torch.full(
-            (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
-            i -= 1
-        
-        return input
-    
-    @torch.inference_mode()
-    def p_sample_loop_v3_image_only(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
-        b = shape_image[0]
-        img = torch.randn(shape_image, device=device)
-        input = img
-
-        i = self.num_timesteps - 1
-        while i >= 0:
-            input = self.p_sample(input, torch.full(
-            (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
+            timestep = torch.full((b,), i, dtype=torch.long, device=device)
+            if self.use_guide:
+                input = self._apply_guidance(input, real_img, timestep)
+            input = self.p_sample(
+                input,
+                timestep,
+                cond=cond,
+                cond_scale=cond_scale,
+            )
             i -= 1
         
         return input
@@ -733,15 +632,6 @@ class GaussianDiffusion_Nolatent(nn.Module):
                     t, x_start.shape) * noise
         )
 
-    def q_sample_one_step(self, x_prev, t):
-        beta_t = extract(self.betas, t, x_prev.shape)
-        alpha_t = 1.0 - beta_t
-        sqrt_alpha_t = torch.sqrt(alpha_t)
-        sqrt_beta_t = torch.sqrt(beta_t)
-        noise = torch.randn_like(x_prev)
-        x_t = sqrt_alpha_t * x_prev + sqrt_beta_t * noise
-        return x_t
-    
     def p_losses(self, x_start, t, mask_start, cond=None, noise_x=None, noise_m=None, **kwargs):
         device = x_start.device
         x_start = x_start.to(device=device, dtype=torch.float32)
@@ -775,32 +665,6 @@ class GaussianDiffusion_Nolatent(nn.Module):
             raise NotImplementedError()
         return loss
     
-    def p_losses_image_only(self, x_start, t, cond=None, noise_x=None,**kwargs):
-        device = x_start.device
-        x_start = x_start.to(device=device, dtype=torch.float32)
-
-        noise_x = default(noise_x, lambda: torch.randn_like(x_start))
-
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise_x)
-        
-        input = x_noisy
-
-        if is_list_str(cond):
-            cond = bert_embed(
-                tokenize(cond), return_cls_repr=self.text_use_bert_cls)
-            cond = cond.to(device)
-
-        recon = self.denoise_fn(**dict(x=input, time=t, cond=cond, **kwargs))
-
-        x_recon = recon
-        if self.loss_type == 'l1':
-            loss = F.l1_loss(noise_x, x_recon)
-        elif self.loss_type == 'l2':
-            loss = F.mse_loss(noise_x, x_recon)
-        else:
-            raise NotImplementedError()
-        return loss
-
     def forward(self, x, mask, *args, **kwargs):
         b, device, img_size, = x.shape[0], x.device, self.image_size
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long().to(self.device)
@@ -890,19 +754,26 @@ class Trainer(object):
         }
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
+    def _resolve_checkpoint_path(self, milestone):
+        if isinstance(milestone, (str, Path)):
+            candidate = Path(milestone)
+            if candidate.suffix == '.pt' or candidate.exists():
+                return candidate
+            milestone = int(milestone)
+        return self.results_folder / f'model-{milestone}.pt'
+
     def load(self, milestone, map_location=None, **kwargs):
         if milestone == -1:
-            all_milestones = [int(p.stem.split('-')[-1])
-                              for p in Path(self.results_folder).glob('**/*.pt')]
+            all_milestones = [
+                int(p.stem.split('-')[-1])
+                for p in Path(self.results_folder).glob('model-*.pt')
+            ]
             assert len(
                 all_milestones) > 0, 'need to have at least one milestone to load from latest checkpoint (milestone == -1)'
             milestone = max(all_milestones)
-        
-        if map_location:
-            data = torch.load(milestone, map_location=map_location)
-        else:
-            import os
-            data = torch.load(os.path.join(self.results_folder, f'model-{milestone}.pt'))
+
+        checkpoint_path = self._resolve_checkpoint_path(milestone)
+        data = torch.load(str(checkpoint_path), map_location=map_location)
 
         self.step = data['step']
         self.model.load_state_dict(data['model'], **kwargs)
@@ -917,13 +788,14 @@ class Trainer(object):
         log_fn=noop
     ):
         assert callable(log_fn)
+        self.opt.zero_grad()
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
 
                 data_frame = next(self.dl)
-                data = data_frame['img'].to(self.device)
-                mask_sdf = data_frame['mask_sdf'].to(self.device)
+                data = data_frame['img'].to(self.device, dtype=torch.float32)
+                mask_sdf = data_frame['mask_sdf'].to(self.device, dtype=torch.float32)
 
                 with autocast(enabled=self.amp):
 
@@ -937,8 +809,6 @@ class Trainer(object):
                     self.scaler.scale(
                         loss / self.gradient_accumulate_every).backward()
 
-                print(f'{self.step}: {loss.item()}')
-
             log = {'loss': loss.item()}
 
             if exists(self.max_grad_norm):
@@ -949,17 +819,17 @@ class Trainer(object):
             self.scaler.step(self.opt)
             self.scaler.update()
             self.opt.zero_grad()
+            self.step += 1
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-            if self.step != 0 and self.step % self.save_and_sample_every == 0:
+            if self.step % self.save_and_sample_every == 0:
                 self.ema_model.eval()
-                with torch.no_grad():
-                    milestone = self.step // self.save_and_sample_every
+                milestone = self.step // self.save_and_sample_every
                 self.save(milestone)
 
+            print(f'{self.step}: {loss.item()}')
             log_fn(log)
-            self.step += 1
 
         print('training completed')
