@@ -30,3 +30,5 @@ Model/
 *.npz
 *.npy
 *.onnx
+
+tmp_*.txt
