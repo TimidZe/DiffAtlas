@@ -1,400 +1,747 @@
-# DiffAtlas Repository Research Report
+# DiffAtlas Research Notes
 
 ## Scope
 
-This report is based on reading the repository source, configs, scripts, and shipped data layout inside this workspace. I also ran a few lightweight local sanity checks:
-
-- instantiated the default `Unet3D` and diffusion wrapper
-- loaded representative MMWHS and TotalSegmentator samples
-- verified tensor shapes through one forward loss pass
-- inspected the checked-in pretrained artifact under `Model/`
-
-The goal of this report is to describe what the project actually does, how it is wired together, what assumptions it makes, and where the code/docs/scripts diverge.
+This report is based on a full local read-through of the repository at `/home/estar/TZNEW/DiffAtlas/DiffAtlas`, plus inspection of the datasets, checkpoints, Hydra outputs, and logs already present in the workspace. It reflects how this codebase actually works in this checkout, not just how the README describes it.
 
 ## Executive Summary
 
-DiffAtlas is a 3D medical image segmentation project built around a joint image-mask diffusion model. Instead of training a direct image-to-label network, it trains a denoiser on a 6-channel tensor consisting of:
+DiffAtlas is a 3D medical image segmentation project built around a joint image-mask diffusion model.
 
-- 1 image channel
-- 5 signed distance field (SDF) mask channels
+The core idea in code is:
 
-At training time, the model learns to predict the diffusion noise added to both the image and the SDF mask channels. At inference time, it does not freely generate an image-mask pair. Instead, it repeatedly replaces the image channel with a noisy version of the target scan and only lets the reverse process generate the mask channels. In practice, this means the deployed method is a guided conditional segmentation process, where the "conditioning" is implemented by direct image-channel replacement rather than by an explicit conditioning encoder.
+1. Represent each training sample as a 6-channel 3D tensor:
+   - 1 channel for the image volume
+   - 5 channels for class-wise signed distance fields (SDFs) derived from the segmentation mask
+2. Train a denoising diffusion model to predict noise on both the image channel and the 5 SDF channels.
+3. At inference time, do not generate the image freely. Instead, repeatedly overwrite the image channel at every reverse-diffusion step with a noisy version of the real target image.
+4. Let the model generate only the mask/SDF channels under that image guidance, then threshold the generated SDFs at `0` to recover binary class masks.
 
-The repository is small in terms of code and large in terms of bundled data. Most of the project logic lives in:
+In practice, this makes the method much closer to image-guided joint denoising than to unconditional synthesis. The implementation is compact and highly specific:
 
-- `train/train.py`
-- `ddpm/diffusion.py`
-- `Dataset/MMWHS_Dataset.py`
-- `Dataset/TS_Dataset.py`
-- `test/inference.py`
-
-The implementation is workable, but it also contains several inherited or unfinished paths, plus multiple documentation/script issues that would block a fresh user from reproducing results without manual fixes.
+- fixed to `64 x 64 x 64` volumes
+- fixed to 5 foreground classes plus implicit background
+- fixed to SDF-based mask representation
+- fixed in all provided scripts to the custom `Unet3D`
+- training supports an alternative MONAI `UNet`, but inference does not
 
 ## Repository Structure
 
-High-value directories/files:
+The functional core of the repo is small:
 
-- `train/`
-  - Hydra-driven training entrypoint and configs.
-- `ddpm/`
-  - Main model, diffusion process, and training loop.
-- `Dataset/`
-  - Dataset wrappers for MMWHS and TotalSegmentator.
-- `test/`
-  - Inference and metric computation.
-- `traing_scripts/`
-  - Shell launchers for training. The directory name is misspelled as `traing_scripts`, not `training_scripts`.
-- `testing_scripts/`
-  - Shell launchers for inference/evaluation.
-- `data/`
-  - Preprocessed NIfTI volumes are already present in this workspace.
-- `Model/`
-  - Intended checkpoint location.
+- `train/train.py`
+  - Hydra entry point for training
+  - builds the model, wraps it in `nn.DataParallel`, builds the diffusion object, chooses the dataset, and launches training
+- `test/inference.py`
+  - Hydra entry point for inference and metric computation
+  - loads a checkpoint, rebuilds the diffusion model, performs guided sampling, writes NIfTI outputs, and computes Dice/NSD
+- `ddpm/diffusion.py`
+  - main 3D diffusion model, noise schedule, sampling loop, and trainer
+- `ddpm/unet.py`
+  - alternative MONAI-style UNet implementation
+- `Dataset/MMWHS_Dataset.py`
+  - loader for MMWHS CT/MRI data using precomputed SDFs
+- `Dataset/TS_Dataset.py`
+  - loader for TotalSegmentator data with online SDF computation
 - `sdf.py`
-  - SDF generation utility used by TotalSegmentator.
+  - SDF construction routine
+- `train/config/*`
+  - Hydra configuration templates
+- `test/confs/infer.yaml`
+  - Hydra inference config template
+- `traing_scripts/*.sh`
+  - canned training commands
+- `testing_scripts/*.sh`
+  - canned inference commands
 
-Code footprint is modest; data footprint is the bulk of the repo.
+There are also local workspace artifacts:
 
-## What the Project Actually Models
+- `Model/`
+  - pretrained checkpoints and a newer manual single-GPU run
+- `outputs/`
+  - Hydra run directories
+- `log_train/`, `log_inference/`
+  - recorded logs
 
-### Core representation
+## What The Project Actually Segments
 
-The default configuration uses `diffusion_num_channels=6`. That is not six image modalities. It is:
+Although the datasets are named MMWHS and TotalSegmentator, this code is not general-purpose multi-class segmentation for arbitrary label sets.
 
-- channel 0: normalized 3D medical image
-- channels 1-5: per-class SDF volumes
+The implementation is hard-coded for 5 foreground classes:
 
-This is visible in the training loss path in `ddpm/diffusion.py:745-776`, where:
+- label `1`
+- label `2`
+- label `3`
+- label `4`
+- label `5`
 
-- image noise is added to `x_start`
-- mask noise is added to `mask_start`
-- the two are concatenated and passed through the denoiser
-- the denoiser predicts noise for both parts
+Background is implicit and reconstructed only at evaluation time.
 
-The segmentation output is therefore not trained as categorical logits. It is trained as five continuous SDF channels, one per foreground class.
+Every loader converts the integer mask into 5 one-vs-rest binary channels:
 
-### Why SDFs matter here
+- `label_1 = (mask == 1)`
+- `label_2 = (mask == 2)`
+- `label_3 = (mask == 3)`
+- `label_4 = (mask == 4)`
+- `label_5 = (mask == 5)`
 
-`sdf.py:5-10` defines the SDF as:
+This means the TotalSegmentator data in this repo has already been reduced to a 5-class problem. The original broader label space of TotalSegmentator is not used here.
 
-- `outside_dist - inside_dist`
-- divided by `32.0`
-- clipped to `[-0.2, 0.2]`
+## Data Layout And Local Dataset State
 
-So inside an object the SDF is negative, and outside it is positive. During inference, each generated SDF channel is converted back to a binary mask by thresholding at zero in `test/inference.py:283-307`.
+### Expected MMWHS layout
 
-This is an important design choice. The model is not directly predicting hard masks. It predicts smooth signed geometry proxies and then thresholds them.
+The MMWHS loader expects flat directories containing:
 
-## Data Pipeline and Dataset Assumptions
+- `*-image.nii.gz`
+- `*-label.nii.gz`
+- `*-sdf.nii.gz`
 
-### Datasets present in this workspace
+Examples found locally:
 
-Observed counts in the checked-in data:
+- `data/MMWHS/CT/all/MMWHS-CT-001-image.nii.gz`
+- `data/MMWHS/CT/all/MMWHS-CT-001-label.nii.gz`
+- `data/MMWHS/CT/all/MMWHS-CT-001-sdf.nii.gz`
+- `data/MMWHS/MRI/all/mr_train_1001_image.nii.gz`
+- `data/MMWHS/MRI/all/mr_train_1001_label.nii.gz`
+- `data/MMWHS/MRI/all/mr_train_1001_sdf.nii.gz`
 
-- `data/MMWHS/CT/training_set_full`: 16 scans
-- `data/MMWHS/CT/testing_set`: 4 scans
-- `data/MMWHS/CT/all`: 20 scans
-- `data/MMWHS/MRI/training_set_full`: 16 scans
-- `data/MMWHS/MRI/testing_set`: 4 scans
-- `data/MMWHS/MRI/all`: 20 scans
-- `data/TotalSegmentator/train`: 596 scans
-- `data/TotalSegmentator/test`: 150 scans
+The loader now explicitly fails if the SDF file is missing.
 
-These counts match the README claim that MMWHS `all` is training plus testing.
+### Expected TotalSegmentator layout
 
-### MMWHS loader
+The TotalSegmentator loader expects per-case subdirectories containing:
 
-`Dataset/MMWHS_Dataset.py`:
+- `*image.nii.gz`
+- `*label.nii.gz`
 
-- loads `*image.nii.gz`, corresponding `*label.nii.gz`, and precomputed `*sdf.nii.gz`
-- applies intensity preprocessing based on modality:
-  - CT: clamp `[-250, 800]`, rescale to `[-1, 1]`
-  - MRI: clamp `[0, 1000]`, rescale to `[-1, 1]`
-- crops/pads image and label to `(64, 64, 64)`
-- during training, optionally flips along axis 1
-- converts integer labels `1..5` into five one-vs-rest foreground channels
+Example found locally:
 
-Important implementation detail:
+- `data/TotalSegmentator/train/s0331/s0331-image.nii.gz`
+- `data/TotalSegmentator/train/s0331/s0331-label.nii.gz`
 
-- the MMWHS SDF is expected to already exist on disk and is not recomputed in the loader
-- the code does not apply an explicit crop/pad transform to the SDF before training, but the shipped files are already effectively aligned and load as `(5, 64, 64, 64)` after TorchIO ingestion
+No SDF file is required for this dataset because the loader computes class-wise SDFs online.
 
-### TotalSegmentator loader
+### Local sample counts
 
-`Dataset/TS_Dataset.py` is similar, but with a key difference:
+Observed in this workspace:
 
-- it computes SDFs on the fly from the loaded categorical label map via `compute_sdf`
+- MMWHS CT `all`: 20 image volumes
+- MMWHS CT `training_set_full`: 16 image volumes
+- MMWHS CT `testing_set`: 4 image volumes
+- MMWHS MRI `all`: 20 image volumes
+- MMWHS MRI `training_set_full`: 16 image volumes
+- MMWHS MRI `testing_set`: 4 image volumes
+- TotalSegmentator `train`: 596 image volumes
+- TotalSegmentator `test`: 150 image volumes
 
-Preprocessing:
+The README statement that MMWHS `all = training_set_full + testing_set` is true for the local data.
 
-- clamp `[-250, 450]`
+### Actual volume shapes on disk
+
+The packaged data already appears preprocessed to `64 x 64 x 64`:
+
+- MMWHS CT image: `(64, 64, 64)`
+- MMWHS CT label: `(64, 64, 64)`
+- MMWHS MRI image: `(64, 64, 64)`
+- TotalSegmentator image: `(64, 64, 64)`
+- TotalSegmentator label: `(64, 64, 64)`
+
+MMWHS SDF files are stored on disk in a higher-dimensional layout but load through `torchio` as:
+
+- `mask_sdf.shape == (5, 64, 64, 64)`
+
+## Preprocessing And Representation
+
+### Image preprocessing
+
+The project uses different fixed intensity windows per dataset/modality:
+
+MMWHS CT:
+
+- clamp to `[-250, 800]`
 - rescale to `[-1, 1]`
 - crop/pad to `(64, 64, 64)`
-- optional flip on train
 
-### Data format observations
+MMWHS MRI:
 
-Local sample inspection shows:
+- clamp to `[0, 1000]`
+- rescale to `[-1, 1]`
+- crop/pad to `(64, 64, 64)`
 
-- images and labels are already stored at `64 x 64 x 64`
-- labels are six-valued categorical masks: background `0` plus foreground `1..5`
-- MMWHS SDF files are stored on disk with an unusual extra-dimension NIfTI layout, but TorchIO ultimately yields `(5, 64, 64, 64)`
+TotalSegmentator:
 
-This means the repo is not handling arbitrary raw clinical scans. It assumes a very specific preprocessed data contract.
+- clamp to `[-250, 450]`
+- rescale to `[-1, 1]`
+- crop/pad to `(64, 64, 64)`
 
-### Dead code in dataset classes
+### Mask preprocessing
 
-Both dataset classes contain unused helpers for:
+Masks are only cropped/padded to `(64, 64, 64)`, then expanded into 5 binary channels.
 
-- 2D projection
-- minimal enclosing circles
-- circle mask creation and expansion to 3D
+### SDF preprocessing
 
-These methods are not referenced anywhere in the repository. They look like remnants from an earlier prompting or ROI-masking idea.
+The SDF representation is central to the method.
+
+For TotalSegmentator, `compute_sdf()` does:
+
+- inside distance transform
+- outside distance transform
+- `sdf = outside_dist - inside_dist`
+- divide by `32.0`
+- clip to `[-0.2, 0.2]`
+
+Interpretation:
+
+- negative values are inside the object
+- positive values are outside the object
+- zero approximates the object boundary
+
+At inference, the model’s generated SDF channels are converted back to masks by:
+
+- `gen_mask_de_sdf = (gen_mask < 0.0)`
+
+Observed locally, both image tensors and SDF tensors end up numerically normalized:
+
+- images in `[-1, 1]`
+- SDFs in `[-0.2, 0.2]`
+
+## Augmentation
+
+Training augmentation is minimal:
+
+- one possible left-right style flip through `torchio.RandomFlip`
+
+The implementation chooses `p` randomly from `{0, 1}` and then builds a deterministic transform with that `flip_probability`. That produces a 50% chance of a guaranteed flip and a 50% chance of no flip, while keeping image, mask, and SDF aligned for the sample.
+
+No elastic deformation, rotation, scaling, cropping jitter, or intensity augmentation is used.
+
+## Dataloader Behavior
+
+This repo has an important asymmetry:
+
+- in training mode, `get_MMWHS_dataloader()` and `get_TS_dataloader()` return the raw `Dataset`
+- in test mode, they return a PyTorch `DataLoader`
+
+The `Trainer` in `ddpm/diffusion.py` constructs its own training `DataLoader`.
+
+Another specificity:
+
+- test loaders hard-code `num_workers=20`
+- they do not use the Hydra `num_workers` setting
+
+Each sample returned by the loaders has:
+
+- `name`: case identifier
+- `img`: shape `(1, 64, 64, 64)`, `float32`
+- `mask_sdf`: shape `(5, 64, 64, 64)`, `float32`
+- `mask`: shape `(5, 64, 64, 64)`, `float32`
+- `affine`: shape `(4, 4)`
 
 ## Model Architecture
 
-### Default backbone: `Unet3D`
+### Primary model: `Unet3D`
 
-The default denoiser is `Unet3D` in `ddpm/diffusion.py:299-448`.
+All provided scripts use `ddpm.diffusion.Unet3D`.
 
-Main characteristics:
+With the shipped config values:
 
-- 3D convolutions with kernels shaped to preserve depth more conservatively than height/width in several places
-- four resolution levels from `dim_mults=(1, 2, 4, 8)`
-- sinusoidal timestep embedding
-- residual blocks with FiLM-like time/condition modulation
-- sparse spatial linear attention
-- temporal attention across the depth/frame axis
-- optional classifier-free guidance machinery via `cond` and `null_cond_prob`
+- base dim: `64`
+- dim multipliers: `(1, 2, 4, 8)`
+- input/output channels: `6`
+- conditioning dimension: `16`
+- parameter count: about `35.85M`
 
-With the default training script settings:
+This model is a custom 3D U-Net-like denoiser with:
 
-- base dim = 64
-- channels = 6
-- parameter count is about 35.85M
+- residual blocks
+- time embedding
+- sparse spatial attention
+- temporal attention
+- skip connections
 
-### Conditioning
+### Depth is treated specially
 
-The code nominally supports conditioning:
+A major architectural specificity is that most convolutions and down/up-sampling are anisotropic:
 
-- `cond_dim=16` is passed in training and inference
-- `Unet3D.forward` fabricates a constant one-hot-like fallback condition if `cond is None`
+- conv kernels are often `(1, 3, 3)`
+- downsample is `(1, 4, 4)` with stride `(1, 2, 2)`
+- upsample is `(1, 4, 4)` with stride `(1, 2, 2)`
 
-In practice, no meaningful external conditioning signal is used anywhere in this repo. The condition is effectively a fixed dummy vector.
+So the network largely preserves the depth axis and downsamples only in-plane at many stages. Depth mixing comes mainly from the temporal-attention path, which treats the depth dimension like a frame axis.
 
-There is also dormant BERT/text-conditioning code in `ddpm/text.py`, inherited from a more general diffusion codebase. It is not used by the actual medical segmentation workflow.
+This is one of the clearest signs that the model was adapted from a video-diffusion style architecture.
 
-### Alternate backbone: `UNet`
+### Conditioning path exists but is effectively constant
 
-`train/train.py:45-50` allows selecting a MONAI-based `UNet` from `ddpm/unet.py`.
+`Unet3D` is built with `cond_dim=16`, but no meaningful conditioning signal is passed anywhere in training or inference.
 
-Important limitation:
+If `cond is None`, the forward path creates a fixed 16D vector whose last entry is `1`. So in real use, the conditioning branch is effectively a learned constant rather than data-dependent conditioning.
 
-- `test/inference.py` always instantiates `Unet3D`
-- there is no corresponding inference branch for the alternate `UNet`
+Classifier-free guidance plumbing exists in the code, but the provided scripts do not use it meaningfully.
 
-So the alternative backbone exists, but the shipped inference path is effectively hard-wired to `Unet3D`.
+### Alternative model: `ddpm/unet.py`
 
-## Diffusion Objective and Training Behavior
+There is a second model implementation based on MONAI building blocks. Training can instantiate it by setting `cfg.model.denoising_fn == 'UNet'`.
 
-### Training entrypoint
+However, inference ignores that option and always rebuilds `Unet3D`.
 
-`train/train.py`:
+Consequence:
 
-- uses Hydra config composition
-- chooses dataset and denoiser
-- wraps the denoiser in `nn.DataParallel`
-- builds `GaussianDiffusion_Nolatent`
-- creates a `Trainer`
-- logs stdout to `log_train/<timestamp>.log`
+- the repository nominally supports two denoisers for training
+- the shipped inference path only supports checkpoints trained with `Unet3D`
 
-### Noise-prediction objective
+## Diffusion Formulation
 
-`GaussianDiffusion_Nolatent` in `ddpm/diffusion.py:469-807` uses:
+The diffusion object is `GaussianDiffusion_Nolatent`.
 
+Important characteristics:
+
+- no latent-space compression
+- diffusion happens directly in voxel space
 - cosine beta schedule
-- standard DDPM forward noising
-- standard reverse mean/variance reconstruction from predicted noise
+- default `timesteps=300` in all provided scripts
+- loss on predicted noise, not directly on segmentation logits
 
-Training loss in `p_losses` is:
+The diffusion state includes standard DDPM buffers:
 
-- `L1(noise_x, predicted_noise_x) + L1(noise_m, predicted_noise_m)` by default
+- `betas`
+- `alphas_cumprod`
+- `sqrt_alphas_cumprod`
+- posterior coefficients
+- related cached tensors
 
-So the model is trained as a conventional noise predictor over the concatenated image-plus-SDF tensor.
+Those buffers are saved inside the checkpoint state dict along with the denoiser weights.
 
-### What "Nolatent" means here
+### What is diffused
 
-The class name suggests there is no separate latent autoencoder stage. The diffusion process operates directly in the voxel space of the preprocessed image and SDF channels.
+Training separates the sample into:
 
-### Trainer behavior
+- `x_start`: image tensor of shape `(B, 1, 64, 64, 64)`
+- `mask_start`: SDF tensor of shape `(B, 5, 64, 64, 64)`
 
-`Trainer` in `ddpm/diffusion.py:811-965`:
+Noise is added independently to image and mask-SDF channels:
 
-- wraps the dataset in a PyTorch `DataLoader`
-- uses gradient accumulation
-- keeps an EMA copy of the model
-- saves checkpoints every `save_and_sample_every`
+- `x_noisy = q_sample(x_start, t, noise_x)`
+- `m_noisy = q_sample(mask_start, t, noise_m)`
 
-Notable specifics:
+These are concatenated into a 6-channel input to the denoiser:
 
-- MMWHS scripts train for `10001` optimizer steps
-- TotalSegmentator trains for `50001` optimizer steps
-- effective batch size is `batch_size * gradient_accumulate_every`
-- the trainer saves checkpoints as `model-<milestone>.pt`
-- despite the class being called `Trainer`, it does not sample or validate during training; it only saves checkpoints
+- `input = cat(x_noisy, m_noisy)`
 
-The logging string `found {len(self.ds)} videos as gif files` is clearly inherited from another project and has nothing to do with this repo's NIfTI datasets.
+The denoiser predicts a 6-channel noise tensor, which is split back into:
 
-## Inference and Segmentation Mechanics
+- predicted image noise
+- predicted mask noise
 
-### Inference entrypoint
+### Loss
 
-`test/inference.py`:
+The total loss is a simple sum:
 
-- loads config from `test/confs/infer.yaml` plus CLI overrides
-- instantiates `Unet3D`
-- wraps it in `GaussianDiffusion_Nolatent`
-- loads weights from `model_path/model-{model_num}.pt`
-- iterates over the test dataloader
-- runs `diffusion.p_sample_loop`
-- thresholds generated SDFs to binary masks
-- computes Dice and NSD
-- writes outputs under `inference_visualization/`
+- image noise reconstruction loss
+- mask noise reconstruction loss
 
-### The key project-specific inference trick
+Supported losses:
 
-The main inference behavior is in `ddpm/diffusion.py:643-666`.
+- `l1`
+- `l2`
 
-For every reverse timestep:
+All provided configs use `l1`.
 
-1. sample the target image forward to the current noise level with `q_sample`
-2. overwrite channel 0 of the current state with that noisy real image
-3. run one reverse denoising step on the concatenated image-plus-mask tensor
+There is no explicit segmentation-only loss, Dice loss, cross-entropy, topology loss, or mutual-exclusion penalty between classes.
 
-This means:
+## Training Pipeline
 
-- the image channel is not actually generated at test time
-- the mask channels are denoised while the image channel is forcibly anchored to the target scan at every timestep
+### Entry point
 
-This is the most important implementation detail in the repo. It is the practical mechanism by which the diffusion model becomes a segmentation model.
+`train/train.py` is the training entry point.
 
-### Mask decoding
+High-level flow:
+
+1. set random seed to `1`
+2. build `Unet3D` or MONAI `UNet`
+3. wrap the denoiser in `nn.DataParallel`
+4. wrap that in `GaussianDiffusion_Nolatent`
+5. construct the dataset
+6. instantiate `Trainer`
+7. optionally load a checkpoint
+8. train until `train_num_steps`
+
+One important detail:
+
+- the training entry point hard-codes `set_seed(1)`
+- the commented-out line suggests the config seed was intended to be used, but it is not active in the current code
+
+### Default script settings
+
+The provided shell scripts all use:
+
+- `diffusion_img_size=64`
+- `diffusion_depth_size=64`
+- `diffusion_num_channels=6`
+- `timesteps=300`
+- `loss_type=l1`
+
+Typical MMWHS training:
+
+- `train_num_steps=10000`
+- `save_and_sample_every=100`
+
+TotalSegmentator training:
+
+- `train_num_steps=50000`
+- `save_and_sample_every=100`
+
+There is also a newer local helper script:
+
+- `traing_scripts/train_5jobs_singlegpu.sh`
+
+That script launches 5 separate single-GPU jobs with smaller per-step batch sizes and larger gradient accumulation. It writes checkpoints under:
+
+- `Model/manual_20260322_202341_singlegpu/`
+
+### Trainer details
+
+The trainer:
+
+- creates a `DataLoader` internally
+- cycles over it indefinitely
+- uses AMP optionally, but all provided configs use `amp=False`
+- maintains an EMA copy of the entire diffusion model
+- saves both raw and EMA states
+
+EMA settings:
+
+- `ema_decay = 0.995`
+- `step_start_ema = 2000`
+- `update_ema_every = 10`
+
+Checkpoint contents:
+
+- `step`
+- `model`
+- `ema`
+- `scaler`
+- `optimizer`
+
+The checkpoint keys `model` and `ema` are full diffusion-model state dicts, not just bare denoiser weights.
+
+### Local evidence from logs
+
+One local training log at `log_train/manual_20260322_202341_singlegpu/train_MMWHSCT_all_gpu1.log` shows:
+
+- `len_dl 10` for the 20-case MMWHS CT all split with batch size 2
+- training loss drops from about `1.76` into the `0.3` to `0.8` range over time
+
+The log still contains a leftover source-project message:
+
+- `found 20 videos as gif files`
+
+That message is obviously inherited from upstream diffusion/video code and is not semantically correct for this project.
+
+## Inference Pipeline
+
+### Entry point
+
+`test/inference.py` is the evaluation and sampling entry point.
+
+High-level flow:
+
+1. rebuild `Unet3D`
+2. rebuild `GaussianDiffusion_Nolatent`
+3. load checkpoint weights from `weight_key` in the checkpoint, default `ema`
+4. iterate over test cases
+5. run reverse diffusion with image guidance
+6. threshold generated SDFs into masks
+7. save generated and real NIfTI files
+8. compute Dice and NSD
+
+### Checkpoint resolution behavior
+
+The helper `resolve_checkpoint_path(model_path, model_num)` behaves as follows:
+
+- if `model_path` is a file, use it directly
+- otherwise look for `model_path / f"model-{model_num}.pt"`
+
+This matches the provided testing scripts, which pass values like:
+
+- `model_path=./Model/DiffAtlas_MMWHS-CT_full`
+- `model_num=pretrained_MMWHSCT_full`
+
+So inference looks for:
+
+- `./Model/DiffAtlas_MMWHS-CT_full/model-pretrained_MMWHSCT_full.pt`
+
+### EMA loading
+
+Inference defaults to:
+
+- `weight_key: ema`
+
+This is correct for the saved checkpoint format and matches the README note.
+
+### Guided sampling is the key test-time trick
+
+The most important inference-specific behavior is in `_apply_guidance()`:
+
+- compute a noisy version of the real target image at timestep `t`
+- overwrite channel `0` of the current sample with that noisy real image
+
+So during every reverse step:
+
+- the image channel is forcibly aligned to the target case
+- only the mask/SDF channels are genuinely being denoised/generated
+
+This is the practical mechanism that makes the method image-guided at inference time.
+
+### Output decoding
 
 After sampling:
 
-- each generated SDF channel is binarized with `gen_mask_i < 0`
-- a background channel is synthesized
-- all channels are concatenated
-- `argmax` is used to form a single categorical mask volume
+- `result[:, 1:]` is taken as generated SDF mask channels
+- each channel is thresholded at `0`
+- class channels are saved separately
 
-Implication:
+Then a combined label map is formed by:
 
-- overlapping foreground predictions are resolved by naive argmax over equal-valued binary channels
-- if multiple foreground classes claim the same voxel, the lower-index class wins
+1. creating a background channel where no foreground class is active
+2. concatenating background plus 5 class channels
+3. taking `argmax`
 
-### What is saved
+One implication:
 
-The inference script saves:
+- if multiple foreground classes overlap after thresholding, `argmax` will break ties by channel order, favoring the lowest-index active class
 
-- the real input image
-- generated SDF masks per class
-- thresholded generated binary masks per class
-- real SDF masks
-- real binary masks
-- the merged generated categorical mask
+There is no explicit overlap resolution beyond that.
 
-It does not save the generated image channel, even though `gen_image` is extracted.
+### Multi-seed inference
+
+Inference supports repeated sampling per case:
+
+- `seed_num`
+
+For each case, the code:
+
+- derives a deterministic case/trial seed
+- samples `seed_num` times
+- averages Dice and NSD across trials
+
+The default config uses:
+
+- `seed=1`
+- `seed_num=1`
+- `deterministic=true`
+
+### Saved outputs
+
+Per case, the inference script writes:
+
+- the real image
+- generated SDF for each class
+- thresholded generated mask for each class
+- real SDF for each class
+- real binary mask for each class
+- combined generated label map
+
+All outputs are written as NIfTI files under:
+
+- `inference_visualization/<dir_name>/<model_num>/`
 
 ## Metrics
 
 ### Dice
 
-Dice is computed per class on the thresholded binary outputs.
+Dice is computed per class from the thresholded binary outputs.
+
+If both prediction and target are empty for a class, Dice is set to `1.0`.
 
 ### NSD
 
-NSD is implemented manually in `test/inference.py` rather than using MONAI's built-in metrics.
+The repo includes a custom NSD implementation in `test/inference.py`.
 
-Important caveat:
+Important specifics:
 
-- the metric implementation supports physical spacing
-- the call site does not pass real voxel spacing
-- default spacing `(1.0, 1.0, 1.0)` is therefore used for all scans
+- `NSDMetric(n_classes=6)` is used
+- background is ignored internally
+- threshold is fixed at `1.0` for every foreground class
+- output is a 5-element vector for the foreground classes
 
-That matters because inspected MMWHS affines are anisotropic, for example roughly:
+The implementation computes simple boundary distances using binary dilation and Euclidean distance transforms. It is not a library callout; it is a local custom implementation.
 
-- CT sample: `(2.43, 1.99, 1.96)`
-- MRI sample: `(1.17, 1.12, 1.19)`
+A local smoke-test inference log at `log_inference/cuda_smoke_mmwhsct/pretrained_MMWHSCT_full.log` shows one sampled MMWHS CT case with per-class Dice roughly:
 
-So the reported NSD is effectively computed in normalized voxel space, not true physical millimeters.
+- `0.765`
+- `0.897`
+- `0.877`
+- `0.726`
+- `0.842`
 
-## Config and Script Behavior
+and NSD roughly:
 
-### Hydra setup
+- `0.739`
+- `0.802`
+- `0.777`
+- `0.525`
+- `0.572`
 
-Training config composition is minimal:
+## Configuration System
+
+Hydra is used, but only lightly.
+
+Config templates mostly define placeholders:
 
 - `train/config/base_cfg.yaml`
-- dataset-specific YAML under `train/config/dataset/`
-- model YAML under `train/config/model/ddpm.yaml`
+- `train/config/model/ddpm.yaml`
+- `train/config/dataset/MMWHS.yaml`
+- `train/config/dataset/TS.yaml`
+- `test/confs/infer.yaml`
 
-The shell scripts provide almost all meaningful values via command-line overrides.
+Most real values are supplied on the command line by the shell scripts.
 
-### Effective training settings in scripts
+An observed Hydra output from `outputs/2026-03-22/20-23-43/.hydra/config.yaml` confirms a recent single-GPU run used:
 
-The provided scripts consistently use:
+- dataset: MMWHS MRI full training set
+- batch size: `1`
+- gradient accumulation: `24`
+- save interval: `1000`
+- train steps: `10000`
 
-- image size `64`
-- depth size `64`
-- channels `6`
-- timesteps `300`
-- batch size `12`
-- `num_workers=20`
+## Checkpoints Present In This Workspace
 
-This repo is tuned around the preprocessed `64^3` regime. It is not a generic multi-resolution pipeline.
+Pretrained checkpoint files found locally:
 
-## Empirical Sanity Checks
+- `Model/DiffAtlas_MMWHS-CT_all/model-pretrained_MMWHSCT_all.pt`
+- `Model/DiffAtlas_MMWHS-CT_full/model-pretrained_MMWHSCT_full.pt`
+- `Model/DiffAtlas_MMWHS-MRI_all/model-pretrained_MMWHSMRI_all.pt`
+- `Model/DiffAtlas_MMWHS-MRI_full/model-pretrained_MMWHSMRI_full.pt`
 
-I ran a forward pass using one MMWHS CT sample and the default model/diffusion stack. The tensor contract is internally consistent:
+Additional local training outputs:
 
-- image tensor: `(1, 1, 64, 64, 64)`
-- SDF tensor: `(1, 5, 64, 64, 64)`
-- concatenated diffusion state: 6 channels total
+- `Model/manual_20260322_202341_singlegpu/DiffAtlas_MMWHS-CT_all_gpu1/model-1.pt` through `model-4.pt`
+- same pattern for MMWHS CT full, MMWHS MRI all, MMWHS MRI full
+- TotalSegmentator local run currently has `model-1.pt` and `model-2.pt`
 
-I also ran a tiny 2-step random-weight sampling pass and confirmed the inference path returns `(1, 6, 64, 64, 64)` with image and mask values clamped within `[-1, 1]` by the diffusion reconstruction path.
+Inspecting one pretrained checkpoint confirmed:
 
-## Specific Findings and Rough Edges
+- top-level keys are `ema`, `model`, `optimizer`, `scaler`, `step`
+- one local pretrained file is currently at `step = 6300`
 
-1. Critical Execution Crashers (Needs Immediate Fixes)
-These bugs will immediately crash the pipeline or result in completely invalid out-of-the-box behavior.
+## Important Implementation Specificities
 
-CUDA Device Mismatch in Inference: During inference, gen_mask remains on the GPU because it is sliced directly from result. The code then mixes it with CPU tensors like torch.tensor(1.0) and background_mask. This will cause a device mismatch crash on the GPU.
+These are the details most likely to matter if this repo is extended or debugged.
 
+### 1. The method is joint image-mask diffusion, but inference is image-clamped
 
-Broken map_location Checkpoint Loading: In Trainer.load, if map_location is provided, the code executes torch.load(milestone, map_location=map_location) instead of joining the milestone integer with the results_folder path. Passing an integer to torch.load will throw an error.
+The model is trained to denoise both image and mask channels. But at test time, the image channel is forcibly replaced with the real noisy target image at every reverse step. So the deployed behavior is much closer to conditional mask generation than to full joint image-mask synthesis.
 
-MMWHS MRI "All" Script Directory Mismatch: The script train_MMWHSMRI_all.sh points to ./data/MMWHS/MRI/training_all, but the data is instructed to be placed in ./data/MMWHS/MRI/all. The script will fail immediately due to a missing directory.
+### 2. The segmentation output is SDF-first, not label-first
 
-2. Methodological & Metric Flaws
-These bugs allow the code to run but silently compromise the validity of the model's outputs and evaluation metrics.
+The model never predicts class logits directly. It predicts continuous SDF values per class and later thresholds them at zero.
 
-Inference Ignores EMA Weights: Diffusion models heavily rely on Exponential Moving Average (EMA) weights for high-quality sampling. While Trainer.save correctly saves both model and ema, the inference script explicitly extracts and loads only ["model"].
+### 3. Foreground classes are independent during training
 
-Guidance Toggles and Unguided Sampling are Broken: The sampling loop condition if self.use_guide is not None: evaluates to True even if use_guide=False. Furthermore, if use_guide=None is explicitly passed, the lack of an else branch means the reverse diffusion loop does absolutely no denoising, returning the initial random noise.
+The training loss treats the 5 SDF channels independently. Class exclusivity is not enforced during training. Any competition between classes appears only when the final hard label map is assembled with background plus `argmax`.
 
-NSD Evaluation Ignores Real Voxel Spacing: The get_nsd metric is called without passing a spacing argument. This forces compute_surface_dice to fall back to the default (1.0, 1.0, 1.0) spacing. For anisotropic medical volumes, this will result in mathematically incorrect boundary metrics.
+### 4. The code is tightly bound to 5 classes
 
-3. Silent Logic Bugs & Scheduling Errors
-These are underlying logical errors where the code behaves differently than its variables or configurations suggest.
+This assumption appears everywhere:
 
-Trainer Off-By-One Errors: In Trainer.train, optimizer steps occur before the save and EMA conditions are checked, and self.step is only incremented at the very end of the loop. This causes checkpoints to lag by one update step, and explains why the training scripts must specify 10001 or 50001 steps to trigger the final save.
+- dataset loaders
+- channel count in scripts
+- inference post-processing
+- metric class count
 
-Unused Reverse Diffusion Schedule Variables: The main p_sample_loop constructs a recurrent schedule array intended for RePaint-style scheduling, but never actually reads from it during the reverse process. 
+Changing the class count would require coordinated edits in multiple files.
 
-Inference RNG is Deliberately Discarded: At the end of every inference case, th.random.seed() and th.cuda.seed() are called without arguments, which reseeds the generators from entropy. This intentionally prevents reproducible evaluations.
+### 5. Inference is hard-coded to `Unet3D`
 
-4. Repository Housekeeping & Data Asymmetries
-These points affect the readability and maintainability of the project.
+This is one of the most important practical limitations in the repo. Training exposes a `denoising_fn` switch, but inference does not mirror it.
 
-README Path and Naming Typos: The README refers to training_scripts, but the actual folder is traing_scripts. Additionally, inference expects checkpoints named model-{model_num}.pt, which does not align with the pretrained_MMWHSCT_full output filenames suggested in the README.
+### 6. `num_frames` exists but is mostly structural
+
+The diffusion object stores `num_frames`, but it is not actively used to enforce shapes in the core logic. The effective depth assumption instead comes from the dataset preprocessing and the network layout.
+
+### 7. DataParallel is used only for training-time denoising
+
+`train/train.py` wraps the denoiser in `nn.DataParallel`, and inference later strips the `module.` prefix from saved weights. This is why the loader includes `strip_module_prefix()`.
+
+### 8. TotalSegmentator uses a custom Nibabel reader
+
+The TS loader explicitly routes image reading through `nibabel_reader()`, returning a tensor plus affine. The MMWHS loader uses standard `torchio` image loading. This difference is intentional in the local code.
+
+### 9. The codebase still carries upstream diffusion/video artifacts
+
+Evidence includes:
+
+- the “videos as gif files” training log message
+- the temporal-attention framing
+- the depth-as-frame architectural treatment
+
+This is not a problem by itself, but it explains several naming choices that otherwise look odd in a medical segmentation project.
+
+### 10. The text-conditioning path is dormant and incomplete
+
+`ddpm/text.py` is inherited support code for BERT-based conditioning. It is not used by the provided training or inference scripts.
+
+There is also a correctness issue in that file:
+
+- `bert_embed()` computes a masked mean embedding in the non-CLS branch
+- but ends with a bare `return`
+- so that branch returns `None`
+
+This does not affect the current DiffAtlas pipeline because text conditioning is not used here, but it would matter if someone tried to enable that path later.
+
+## Mismatches, Limitations, And Risks
+
+### Training/inference model mismatch risk
+
+If someone trains with the alternative MONAI `UNet`, the provided inference script will not load it correctly because it always instantiates `Unet3D`.
+
+### Hard-coded evaluation assumptions
+
+NSD assumes:
+
+- 6 total classes including background
+- 5 evaluated foreground classes
+- 1 mm threshold for all classes
+
+That is tightly coupled to the current datasets and label encoding.
+
+### Limited augmentation
+
+The augmentation policy is extremely light. Generalization is therefore carried mostly by the diffusion formulation, the SDF representation, and the cross-domain training setups rather than rich data augmentation.
+
+### No explicit use of spacing in final reported Dice
+
+Dice is pure voxel overlap. NSD can accept spacing but the inference call uses the default spacing tuple rather than pulling per-case voxel spacing from the affine/header.
+
+### Background handling is deferred
+
+Background is not predicted directly during training. It is reconstructed at inference by checking where no foreground class is active.
+
+## How To Think About This Repository
+
+The most accurate mental model for this codebase is:
+
+- a compact 3D DDPM
+- trained on concatenated image plus per-class SDF channels
+- operating on already standardized `64^3` medical volumes
+- using a video-style 3D U-Net that treats depth partly as a temporal axis
+- evaluated by clamping the image trajectory to the real target scan and letting the model denoise only the anatomical shape representation
+
+So despite the “atlas” framing in the paper and README, the implementation here is not classical atlas registration. It is a learned diffusion prior over image-mask pairs with strong test-time image guidance.
+
+## Bottom Line
+
+This repo is technically focused and relatively easy to reason about because almost everything important is fixed:
+
+- one spatial size
+- one joint 6-channel representation
+- five foreground classes
+- one dominant denoiser architecture
+- one SDF thresholding rule
+- one guided-sampling strategy
+
+Its main strengths are simplicity and a clean end-to-end path from dataset to checkpoint to NIfTI outputs.
+
+Its main constraints are the hard-coded class/channel assumptions, the inference-only support for `Unet3D`, and the fact that “conditioning” in the denoiser is mostly vestigial while the real conditioning happens by directly overwriting the image channel during reverse diffusion.
