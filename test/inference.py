@@ -261,6 +261,28 @@ def main(conf: DictConfig):
     diffusion.eval()
     model.eval()
 
+    sampler_cfg = conf.get('sampler')
+    if sampler_cfg is None:
+        sampler_cfg = OmegaConf.create({
+            'name': 'ddpm',
+            'ddim_steps': 50,
+            'eta': 0.0,
+        })
+
+    guidance_cfg = conf.get('guidance')
+    if guidance_cfg is None:
+        guidance_cfg = OmegaConf.create({
+            'mode': 'replace',
+            'gamma': 0.5,
+            'gamma_schedule': 'mid',
+            'lambda_lncc': 1.0,
+            'lambda_edge': 0.1,
+            'lncc_win': 9,
+            'grad_clip': 1.0,
+            'apply_to': 'mask_only',
+            'log_every_step': False,
+        })
+
     print("sampling...")
     
     if conf.dataset == 'MMWHS':
@@ -303,13 +325,16 @@ def main(conf: DictConfig):
             print("     seed:", seed)
             set_seed(seed, deterministic=conf.deterministic)
 
-            sample_fn = diffusion.p_sample_loop
-
-            result = sample_fn(
+            result = diffusion.sample(
                 shape_image = real_image.size(),
                 shape_mask = real_mask_sdf.size(),
                 device=device,
                 image=real_image,
+                sampler=sampler_cfg.name,
+                ddim_steps=sampler_cfg.ddim_steps,
+                eta=sampler_cfg.eta,
+                guidance_mode=guidance_cfg.mode,
+                guidance_cfg=guidance_cfg,
             )
 
             gen_mask = result[:,1:(result.size()[1]),:,:,:]

@@ -7,6 +7,22 @@ timesteps: ???
 loss_type: l1 
 use_guide: true
 
+sampler:
+  name: ddpm
+  ddim_steps: 50
+  eta: 0.0
+
+guidance:
+  mode: replace
+  gamma: 0.5
+  gamma_schedule: mid
+  lambda_lncc: 1.0
+  lambda_edge: 0.1
+  lncc_win: 9
+  grad_clip: 1.0
+  apply_to: mask_only
+  log_every_step: false
+
 model_path: ???
 model_num: ???
 weight_key: ema

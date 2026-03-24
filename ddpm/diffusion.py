@@ -10,6 +10,7 @@ from torch.cuda.amp import autocast, GradScaler
 from einops import rearrange
 from einops_exts import rearrange_many
 from rotary_embedding_torch import RotaryEmbedding
+from ddpm.guidance import LNCCLoss3D, EdgeLoss3D, build_guidance_scale, clamp_joint_x0, cfg_get
 from ddpm.text import tokenize, bert_embed, BERT_MODEL_DIM
 from torch.utils.data import DataLoader
 
@@ -466,6 +467,16 @@ def cosine_beta_schedule(timesteps, s=0.008):
     return torch.clip(betas, 0, 0.9999)
 
 
+def make_ddim_timesteps(num_ddim_steps, num_ddpm_steps):
+    if num_ddim_steps >= num_ddpm_steps:
+        return torch.arange(num_ddpm_steps - 1, -1, -1, dtype=torch.long)
+    step_ratio = num_ddpm_steps / num_ddim_steps
+    steps = torch.arange(num_ddim_steps, dtype=torch.float32) * step_ratio
+    steps = torch.round(steps).long().clamp(max=num_ddpm_steps - 1)
+    steps = steps.unique(sorted=True)
+    return torch.flip(steps, dims=[0])
+
+
 class GaussianDiffusion_Nolatent(nn.Module):
     def __init__(
         self,
@@ -560,25 +571,16 @@ class GaussianDiffusion_Nolatent(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
+    def _predict_noise(self, x, t, cond=None, cond_scale=1.):
         if isinstance(self.denoise_fn, torch.nn.DataParallel):
-            noise = self.denoise_fn.module.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
-        else:
-            noise = self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
-        x_recon = self.predict_start_from_noise(
-            x, t=t, noise=noise)
-        if clip_denoised:
-            s = 1.
-            if self.use_dynamic_thres:
-                s = torch.quantile(
-                    rearrange(x_recon, 'b ... -> b (...)').abs(),
-                    self.dynamic_thres_percentile,
-                    dim=-1
-                )
-                s.clamp_(min=1.)
-                s = s.view(-1, *((1,) * (x_recon.ndim - 1)))
+            return self.denoise_fn.module.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
+        return self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
 
-            x_recon = x_recon.clamp(-s, s) / s
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
+        noise = self._predict_noise(x, t, cond=cond, cond_scale=cond_scale)
+        x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
+        if clip_denoised:
+            x_recon = clamp_joint_x0(x_recon)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
@@ -598,31 +600,225 @@ class GaussianDiffusion_Nolatent(nn.Module):
         sample = sample.clone()
         sample[:, :1, :, :, :] = real_noisy_image[:, :1, :, :, :]
         return sample
-    
-    @torch.inference_mode()
-    def p_sample_loop(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
-        b = shape_image[0]
+
+    def _init_joint_sample(self, shape_image, shape_mask, device):
         img = torch.randn(shape_image, device=device)
         mask = torch.randn(shape_mask, device=device)
-        input = torch.cat((img, mask), dim=1)
-        real_img = image
-        if self.use_guide and real_img is None:
+        return torch.cat((img, mask), dim=1)
+
+    def ddim_step(self, x_t, t, eps, t_prev=None, eta=0.0, clip_x0=True):
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t.shape)
+        x0_hat = self.predict_start_from_noise(x_t, t=t, noise=eps)
+        if clip_x0:
+            x0_hat = clamp_joint_x0(x0_hat)
+        if t_prev is None:
+            return x0_hat, x0_hat
+
+        alpha_bar_prev = extract(self.alphas_cumprod, t_prev, x_t.shape)
+        sigma = (
+            eta
+            * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t))
+            * torch.sqrt(torch.clamp(1 - alpha_bar_t / alpha_bar_prev, min=0.0))
+        )
+        noise = torch.randn_like(x_t) if eta > 0 else torch.zeros_like(x_t)
+        dir_xt = torch.sqrt(torch.clamp(1 - alpha_bar_prev - sigma ** 2, min=0.0)) * eps
+        x_prev = torch.sqrt(alpha_bar_prev) * x0_hat + dir_xt + sigma * noise
+        return x_prev, x0_hat
+
+    @torch.inference_mode()
+    def p_sample_loop_ddpm_replace(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
+        b = shape_image[0]
+        sample = self._init_joint_sample(shape_image, shape_mask, device)
+        if image is None:
             raise ValueError('Guided sampling requires a real input image')
 
-        i = self.num_timesteps - 1
-        while i >= 0:
+        for i in range(self.num_timesteps - 1, -1, -1):
             timestep = torch.full((b,), i, dtype=torch.long, device=device)
-            if self.use_guide:
-                input = self._apply_guidance(input, real_img, timestep)
-            input = self.p_sample(
-                input,
-                timestep,
+            sample = self._apply_guidance(sample, image, timestep)
+            sample = self.p_sample(sample, timestep, cond=cond, cond_scale=cond_scale)
+        return sample
+
+    @torch.inference_mode()
+    def sample_loop_ddim(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None, ddim_steps=50, eta=0.0, guidance_mode='none', guidance_cfg=None):
+        b = shape_image[0]
+        sample = self._init_joint_sample(shape_image, shape_mask, device)
+        timesteps = make_ddim_timesteps(ddim_steps, self.num_timesteps).to(device)
+
+        for i, t_scalar in enumerate(timesteps):
+            t = torch.full((b,), int(t_scalar.item()), dtype=torch.long, device=device)
+            if guidance_mode == 'replace':
+                if image is None:
+                    raise ValueError('Replace guidance requires a real input image')
+                sample = self._apply_guidance(sample, image, t)
+
+            eps = self._predict_noise(sample, t, cond=cond, cond_scale=cond_scale)
+            t_prev = None
+            if i + 1 < len(timesteps):
+                t_prev_scalar = timesteps[i + 1]
+                t_prev = torch.full((b,), int(t_prev_scalar.item()), dtype=torch.long, device=device)
+            sample, _ = self.ddim_step(sample, t, eps, t_prev=t_prev, eta=eta)
+        return sample
+
+    def _compute_guidance_loss(self, image_hat, image, guidance_cfg, lncc_loss, edge_loss):
+        loss = image_hat.new_tensor(0.0)
+        lambda_lncc = float(cfg_get(guidance_cfg, 'lambda_lncc', 1.0))
+        lambda_edge = float(cfg_get(guidance_cfg, 'lambda_edge', 0.0))
+        if lambda_lncc > 0:
+            loss = loss + lambda_lncc * lncc_loss(image_hat, image)
+        if lambda_edge > 0:
+            loss = loss + lambda_edge * edge_loss(image_hat, image)
+        return loss
+
+    def _log_guidance(self, guidance_cfg, t_scalar, stats):
+        if not cfg_get(guidance_cfg, 'log_every_step', False):
+            return
+        print(
+            f"        step={int(t_scalar)} loss={stats['loss']:.6f} grad_norm={stats['grad_norm']:.6f} "
+            f"gamma={stats['gamma']:.6f} i0_absmax={stats['i0_absmax']:.6f} s0_absmax={stats['s0_absmax']:.6f} "
+            f"xvar_pre={stats['x_var_min_pre_clamp']:.6e} yvar_pre={stats['y_var_min_pre_clamp']:.6e}"
+        )
+
+    def sample_loop_ddim_dps(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None, ddim_steps=50, eta=0.0, guidance_cfg=None, guidance_mode='dps'):
+        if image is None:
+            raise ValueError('DPS guidance requires a real input image')
+
+        b = shape_image[0]
+        sample = self._init_joint_sample(shape_image, shape_mask, device)
+        timesteps = make_ddim_timesteps(ddim_steps, self.num_timesteps).to(device)
+        lncc_loss = LNCCLoss3D(win=int(cfg_get(guidance_cfg, 'lncc_win', 9))).to(device)
+        edge_loss = EdgeLoss3D().to(device)
+
+        for i, t_scalar in enumerate(timesteps):
+            t = torch.full((b,), int(t_scalar.item()), dtype=torch.long, device=device)
+            t_prev = None
+            if i + 1 < len(timesteps):
+                t_prev_scalar = timesteps[i + 1]
+                t_prev = torch.full((b,), int(t_prev_scalar.item()), dtype=torch.long, device=device)
+
+            sample = sample.detach().to(dtype=torch.float32).requires_grad_(True)
+            eps_theta = self._predict_noise(sample, t, cond=cond, cond_scale=cond_scale)
+            x0_hat = clamp_joint_x0(self.predict_start_from_noise(sample, t=t, noise=eps_theta))
+            image_hat = x0_hat[:, :1]
+            loss = self._compute_guidance_loss(image_hat, image, guidance_cfg, lncc_loss, edge_loss)
+            grad = torch.autograd.grad(loss, sample, retain_graph=False, create_graph=False)[0]
+
+            if cfg_get(guidance_cfg, 'apply_to', 'mask_only') == 'mask_only':
+                grad = grad.clone()
+                grad[:, :1] = 0
+
+            grad_flat = grad.reshape(b, -1)
+            grad_norm = torch.linalg.norm(grad_flat, dim=1).view(b, 1, 1, 1, 1).clamp_min(1e-8)
+            grad_unit = grad / grad_norm
+            grad_clip = float(cfg_get(guidance_cfg, 'grad_clip', 1.0))
+            grad_unit = torch.clamp(grad_unit, min=-grad_clip, max=grad_clip)
+
+            gamma_t = build_guidance_scale(
+                t=t,
+                total_steps=self.num_timesteps,
+                base_scale=float(cfg_get(guidance_cfg, 'gamma', 0.5)),
+                mode=cfg_get(guidance_cfg, 'gamma_schedule', 'mid'),
+            ).view(b, 1, 1, 1, 1)
+            alpha_bar_t = extract(self.alphas_cumprod, t, sample.shape)
+            eps_guided = eps_theta - torch.sqrt(1.0 - alpha_bar_t) * gamma_t * grad_unit
+            sample_next, x0_hat = self.ddim_step(sample.detach(), t, eps_guided.detach(), t_prev=t_prev, eta=eta)
+
+            if guidance_mode == 'hybrid' and t_prev is not None:
+                noisy_img = self.q_sample(x_start=image, t=t_prev)
+                sample_next[:, :1] = noisy_img[:, :1]
+
+            stats = {
+                'loss': float(loss.detach().cpu()),
+                'grad_norm': float(grad_norm.mean().detach().cpu()),
+                'gamma': float(gamma_t.mean().detach().cpu()),
+                'i0_absmax': float(image_hat.abs().max().detach().cpu()),
+                's0_absmax': float(x0_hat[:, 1:].abs().max().detach().cpu()),
+                'x_var_min_pre_clamp': lncc_loss.last_stats.get('x_var_min_pre_clamp', 0.0),
+                'y_var_min_pre_clamp': lncc_loss.last_stats.get('y_var_min_pre_clamp', 0.0),
+            }
+            self._log_guidance(guidance_cfg, t_scalar, stats)
+            sample = sample_next.detach()
+        return sample
+
+    def sample(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None, sampler='ddpm', ddim_steps=50, eta=0.0, guidance_mode='replace', guidance_cfg=None):
+        if sampler == 'ddpm':
+            if guidance_mode == 'replace':
+                return self.p_sample_loop_ddpm_replace(
+                    shape_image=shape_image,
+                    shape_mask=shape_mask,
+                    cond=cond,
+                    cond_scale=cond_scale,
+                    device=device,
+                    image=image,
+                )
+            if guidance_mode == 'none':
+                return self.sample_loop_ddim(
+                    shape_image=shape_image,
+                    shape_mask=shape_mask,
+                    cond=cond,
+                    cond_scale=cond_scale,
+                    device=device,
+                    image=None,
+                    ddim_steps=self.num_timesteps,
+                    eta=1.0,
+                    guidance_mode='none',
+                    guidance_cfg=guidance_cfg,
+                )
+            raise ValueError(f"Unsupported ddpm guidance mode: {guidance_mode}")
+
+        if sampler == 'ddim':
+            if guidance_mode in ('none', 'replace'):
+                return self.sample_loop_ddim(
+                    shape_image=shape_image,
+                    shape_mask=shape_mask,
+                    cond=cond,
+                    cond_scale=cond_scale,
+                    device=device,
+                    image=image,
+                    ddim_steps=ddim_steps,
+                    eta=eta,
+                    guidance_mode=guidance_mode,
+                    guidance_cfg=guidance_cfg,
+                )
+            if guidance_mode in ('dps', 'hybrid'):
+                return self.sample_loop_ddim_dps(
+                    shape_image=shape_image,
+                    shape_mask=shape_mask,
+                    cond=cond,
+                    cond_scale=cond_scale,
+                    device=device,
+                    image=image,
+                    ddim_steps=ddim_steps,
+                    eta=eta,
+                    guidance_cfg=guidance_cfg,
+                    guidance_mode=guidance_mode,
+                )
+            raise ValueError(f"Unsupported ddim guidance mode: {guidance_mode}")
+
+        raise ValueError(f"Unsupported sampler: {sampler}")
+
+    @torch.inference_mode()
+    def p_sample_loop(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None, image=None):
+        if self.use_guide:
+            return self.p_sample_loop_ddpm_replace(
+                shape_image=shape_image,
+                shape_mask=shape_mask,
                 cond=cond,
                 cond_scale=cond_scale,
+                device=device,
+                image=image,
             )
-            i -= 1
-        
-        return input
+        return self.sample_loop_ddim(
+            shape_image=shape_image,
+            shape_mask=shape_mask,
+            cond=cond,
+            cond_scale=cond_scale,
+            device=device,
+            image=None,
+            ddim_steps=self.num_timesteps,
+            eta=1.0,
+            guidance_mode='none',
+            guidance_cfg=None,
+        )
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
