@@ -18,6 +18,8 @@ outputs/
 runs/
 wandb/
 logs/
+log_eval/
+log_train/
 checkpoints/
 results/
 fig/

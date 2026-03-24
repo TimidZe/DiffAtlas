@@ -260,6 +260,7 @@ def main(conf: DictConfig):
 
     diffusion.eval()
     model.eval()
+    save_outputs = bool(conf.get('save_outputs', True))
 
     sampler_cfg = conf.get('sampler')
     if sampler_cfg is None:
@@ -285,10 +286,12 @@ def main(conf: DictConfig):
 
     print("sampling...")
     
+    num_workers = conf.get('num_workers')
+
     if conf.dataset == 'MMWHS':
-        dataloader = get_MMWHS_dataloader(root_dir=conf.root_dir, mode=conf.mode, data_type=conf.data_type) 
+        dataloader = get_MMWHS_dataloader(root_dir=conf.root_dir, mode=conf.mode, data_type=conf.data_type, num_workers=num_workers) 
     elif conf.dataset == 'TS' :
-        dataloader = get_TS_dataloader(root_dir=conf.root_dir, mode=conf.mode)
+        dataloader = get_TS_dataloader(root_dir=conf.root_dir, mode=conf.mode, num_workers=num_workers)
     else :
         raise ValueError ("No Such Dataset")
     
@@ -340,30 +343,32 @@ def main(conf: DictConfig):
             gen_mask = result[:,1:(result.size()[1]),:,:,:]
             gen_mask_de_sdf = (gen_mask < 0.0).to(dtype=gen_mask.dtype)
 
-            real_img_to_save = tio.ScalarImage(tensor=real_image.squeeze(0).cpu(), channels_last=False, affine=affine)
-            os.makedirs(os.path.join(vis_dir_name, 'Image'), exist_ok=True)
-            real_img_to_save.save(os.path.join(vis_dir_name, 'Image', f"{gt_name}-image-real.nii.gz"))
+            if save_outputs:
+                real_img_to_save = tio.ScalarImage(tensor=real_image.squeeze(0).cpu(), channels_last=False, affine=affine)
+                os.makedirs(os.path.join(vis_dir_name, 'Image'), exist_ok=True)
+                real_img_to_save.save(os.path.join(vis_dir_name, 'Image', f"{gt_name}-image-real.nii.gz"))
             
             for i in range(gen_mask.size()[1]):
                 gen_mask_i = gen_mask[:, i:i + 1, :, :, :]
                 gen_mask_i_cpu = gen_mask_i.cpu()
                 gen_mask_i_de_sdf = gen_mask_de_sdf[:, i:i + 1, :, :, :].cpu()
                 
-                gen_mask_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_cpu.squeeze(1), channels_last=False, affine=affine)
-                os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
-                gen_mask_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-sdf-{i+1}-gen.nii.gz"))
-                
-                gen_mask_de_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_de_sdf.squeeze(1), channels_last=False, affine=affine)
-                os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
-                gen_mask_de_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-de-sdf-{i+1}-gen.nii.gz"))
+                if save_outputs:
+                    gen_mask_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_cpu.squeeze(1), channels_last=False, affine=affine)
+                    os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
+                    gen_mask_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-sdf-{i+1}-gen.nii.gz"))
+                    
+                    gen_mask_de_sdf_to_save = tio.LabelMap(tensor=gen_mask_i_de_sdf.squeeze(1), channels_last=False, affine=affine)
+                    os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
+                    gen_mask_de_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-de-sdf-{i+1}-gen.nii.gz"))
 
-                real_mask_sdf_to_save = tio.LabelMap(tensor=real_mask_sdf[:,i,:,:,:], channels_last=False, affine=affine)
-                os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
-                real_mask_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-sdf-{i+1}-real.nii.gz"))
-                
-                real_mask_de_sdf_to_save = tio.LabelMap(tensor=real_mask[:,i,:,:,:], channels_last=False, affine=affine)
-                os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
-                real_mask_de_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-de-sdf-{i+1}-real.nii.gz"))
+                    real_mask_sdf_to_save = tio.LabelMap(tensor=real_mask_sdf[:,i,:,:,:], channels_last=False, affine=affine)
+                    os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
+                    real_mask_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-sdf-{i+1}-real.nii.gz"))
+                    
+                    real_mask_de_sdf_to_save = tio.LabelMap(tensor=real_mask[:,i,:,:,:], channels_last=False, affine=affine)
+                    os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
+                    real_mask_de_sdf_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-de-sdf-{i+1}-real.nii.gz"))
 
                 real_mask_i = real_mask[:, i:i + 1, :, :, :]
                 Dice = get_dice(real_mask_i.numpy(), gen_mask_i_de_sdf.numpy())
@@ -373,9 +378,10 @@ def main(conf: DictConfig):
             background_mask = (gen_mask_de_sdf.sum(dim=1, keepdim=True) == 0).to(dtype=gen_mask_de_sdf.dtype)
             gen_mask_togather = torch.cat((background_mask, gen_mask_de_sdf), dim=1)
             gen_mask_togather = torch.argmax(gen_mask_togather, dim=1)
-            gen_mask_togather_to_save = tio.LabelMap(tensor=gen_mask_togather.cpu().int(), channels_last=False, affine=affine)
-            os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
-            gen_mask_togather_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-together-gen.nii.gz"))
+            if save_outputs:
+                gen_mask_togather_to_save = tio.LabelMap(tensor=gen_mask_togather.cpu().int(), channels_last=False, affine=affine)
+                os.makedirs(os.path.join(vis_dir_name, 'Label'), exist_ok=True)
+                gen_mask_togather_to_save.save(os.path.join(vis_dir_name, 'Label', f"{gt_name}-{seed}-label-together-gen.nii.gz"))
 
             get_nsd = NSDMetric(n_classes=6)
             real_mask_togather = real_mask

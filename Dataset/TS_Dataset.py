@@ -102,7 +102,9 @@ class TS_Dataset(Dataset):
             'affine': affine
         }
 
-def get_TS_dataloader(root_dir, mode, batch_size=1, drop_last=False):
+def get_TS_dataloader(root_dir, mode, batch_size=1, drop_last=False, num_workers=None):
+    if num_workers is None:
+        num_workers = int(os.environ.get("DIFFATLAS_NUM_WORKERS", "20"))
     dataset = TS_Dataset(root_dir=root_dir, mode=mode)
     if mode == 'train':
         shuffle = True
@@ -112,6 +114,6 @@ def get_TS_dataloader(root_dir, mode, batch_size=1, drop_last=False):
     else:
         raise ValueError('NO SUCH MODE')
     loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=20, pin_memory=True, drop_last=drop_last
+        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=drop_last
     )
     return loader

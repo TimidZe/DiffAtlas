@@ -1247,7 +1247,7 @@ Completion gate for Phase 6:
 - [x] Run DDIM with `guidance_mode=none`.
 - [x] Run DDIM with `guidance_mode=replace`.
 - [x] Verify that DDIM replace produces output quality in the expected range relative to DDPM replace.
-- [ ] Record runtime differences:
+- [x] Record runtime differences:
   - DDPM replace
   - DDIM none
   - DDIM replace
@@ -1255,7 +1255,7 @@ Completion gate for Phase 6:
 
 Completion gate for Phase 7:
 
-- [ ] There is a fair comparison table for speed and stability before claiming any gain.
+- [x] There is a fair comparison table for speed and stability before claiming any gain.
 
 ### Phase 8: Same-Modality DPS Evaluation
 
@@ -1267,8 +1267,8 @@ Completion gate for Phase 7:
 - [x] Compare per-class Dice.
 - [x] Compare per-class NSD.
 - [x] Check whether edge-magnitude improves small-structure behavior or only adds noise.
-- [ ] Check whether `mask_only` is more stable than `full`.
-- [ ] Check whether `gamma_schedule=mid` helps more than `constant`.
+- [x] Check whether `mask_only` is more stable than `full`.
+- [x] Check whether `gamma_schedule=mid` helps more than `constant`.
 
 Completion gate for Phase 8:
 
@@ -1297,7 +1297,7 @@ Completion gate for Phase 9:
 
 ### Phase 10: Ablations And Hyperparameter Refinement
 
-- [ ] Ablate `apply_to=full` vs `mask_only`.
+- [x] Ablate `apply_to=full` vs `mask_only`.
 - [ ] Ablate `lambda_edge`:
   - `0.0`
   - `0.05`
@@ -1321,6 +1321,78 @@ Completion gate for Phase 9:
 Completion gate for Phase 10:
 
 - [ ] A recommended default config is backed by ablation evidence rather than intuition.
+
+## 22. Same-Modal CT Evaluation Notes
+
+Date: 2026-03-24
+
+Dataset and checkpoint:
+
+- MMWHS CT testing set, 4 held-out cases
+- checkpoint: `Model/DiffAtlas_MMWHS-CT_full/model-pretrained_MMWHSCT_full.pt`
+- evaluation path: direct GPU harness using the repo's current `diffusion.sample(...)` code path and the same MMWHS dataloader/metrics as [`test/inference.py`](/home/estar/TZNEW/DiffAtlas/DiffAtlas/test/inference.py)
+
+Why a direct harness was used instead of the Hydra entry script for the sweep:
+
+- [`test/inference.py`](/home/estar/TZNEW/DiffAtlas/DiffAtlas/test/inference.py) can run in this shell, but Hydra plus this job environment made CUDA initialization unreliable for repeated scripted sweeps
+- the direct harness still exercised the exact sampler implementation under test:
+  - [`ddpm/diffusion.py`](/home/estar/TZNEW/DiffAtlas/DiffAtlas/ddpm/diffusion.py)
+  - [`ddpm/guidance.py`](/home/estar/TZNEW/DiffAtlas/DiffAtlas/ddpm/guidance.py)
+
+Measured same-modal results:
+
+- `ddpm_replace_300`: Dice mean `0.8345`, NSD mean `0.7174`, runtime `48.05s/case`
+- `ddim20_none`: Dice mean `0.0201`, NSD mean `0.0282`, runtime `3.33s/case`
+- `ddim20_replace`: Dice mean `0.7417`, NSD mean `0.4098`, runtime `3.21s/case`
+- `ddim20_dps_mask_lncc_mid`: Dice mean `0.0191`, NSD mean `0.0264`, runtime `7.44s/case`
+- `ddim20_dps_full_lncc_mid`: Dice mean `0.000055`, NSD mean `0.000020`, runtime `7.44s/case`
+- `ddim20_hybrid_mask_lncc_mid`: Dice mean `0.7415`, NSD mean `0.4089`, runtime `7.44s/case`
+- `ddim20_dps_mask_lncc_edge_mid`: Dice mean `0.0191`, NSD mean `0.0263`, runtime `7.45s/case`
+- `ddim20_dps_mask_lncc_const`: Dice mean `0.0189`, NSD mean `0.0262`, runtime `7.44s/case`
+- `ddim20_dps_mask_lncc_mid_g0.05`: Dice mean `0.0200`, NSD mean `0.0282`, runtime `7.47s/case`
+- `ddim20_dps_mask_lncc_mid_g0.01`: Dice mean `0.0201`, NSD mean `0.0282`, runtime `7.41s/case`
+- `ddim20_hybrid_mask_lncc_mid_g0.05`: Dice mean `0.7416`, NSD mean `0.4091`, runtime `7.42s/case`
+- `ddim20_hybrid_mask_lncc_mid_g0.1`: Dice mean `0.7416`, NSD mean `0.4089`, runtime `7.43s/case`
+- `ddim50_none`: Dice mean `0.3065`, NSD mean `0.1555`, runtime `13.11s/case`
+- `ddim50_replace`: Dice mean `0.7324`, NSD mean `0.3650`, runtime `8.04s/case`
+- `ddim50_hybrid_mask_lncc_mid_g0.5`: Dice mean `0.7326`, NSD mean `0.3656`, runtime `18.60s/case`
+- `ddim50_hybrid_mask_lncc_mid_g0.05`: Dice mean `0.7326`, NSD mean `0.3656`, runtime `18.61s/case`
+- `ddim50_dps_mask_lncc_mid_g0.01`: Dice mean `0.3065`, NSD mean `0.1556`, runtime `18.61s/case`
+
+Key findings:
+
+- Pure DPS is not acceptable as the default same-modal CT inference mode.
+- At 20 DDIM steps, pure DPS collapses almost completely:
+  - `mask_only` already falls to near-all-background behavior
+  - `full` is even less stable than `mask_only`
+- Lowering `gamma` from `0.5` to `0.05` or `0.01` does not rescue 20-step pure DPS.
+- Adding the edge term (`lambda_edge=0.1`) does not help the same-modal CT case.
+- `gamma_schedule=mid` and `constant` behave almost identically in the failing pure-DPS regime.
+- `hybrid` is the only DPS-family mode that preserves baseline-quality behavior on same-modal CT.
+- On same-modal CT, `hybrid` is effectively a no-regression wrapper around `replace`, not a real improvement:
+  - 20-step `hybrid` is numerically almost identical to 20-step `replace`
+  - 50-step `hybrid` is only trivially above 50-step `replace`
+  - that tiny difference is not large enough to justify the extra backward-pass cost
+- 50-step pure DPS with very weak guidance (`gamma=0.01`) no longer collapses completely, but it behaves like weakly guided `none` rather than a competitive segmentation method.
+
+Interpretation:
+
+- Same-modal CT already has a very strong observation model under hard replacement.
+- Removing replacement and relying only on image-reconstruction gradients leaves the mask channels underconstrained.
+- In practice, pure DPS drifts away from the image-conditioned manifold and collapses.
+- The fact that weak 50-step pure DPS trends toward `ddim none` supports that interpretation:
+  - once `gamma` is small enough not to destroy the sample, it also becomes too weak to add useful conditioning
+
+Current recommendation for same-modal CT:
+
+- do not use pure `guidance.mode=dps`
+- if a DPS-family method must be used on same-modal CT, use `guidance.mode=hybrid`
+- for same-modal CT, keep `replace` as the default reference path because it is both stronger and cheaper than `hybrid`
+
+Implication for the next phase:
+
+- same-modal CT should be treated as a stability gate, not as the place where pure DPS is expected to outperform baseline
+- if DPS is going to help, it is more likely to help in cross-modality transfer, where hard replacement is a cruder fit to the observation model
 
 ### Phase 11: Result Consolidation
 

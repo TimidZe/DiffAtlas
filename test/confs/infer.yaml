@@ -32,6 +32,8 @@ dataset: ???
 mode: ???
 data_type: ???
 root_dir: ???
+num_workers: null
+save_outputs: true
 device: null
 seed: 1
 seed_num: 1

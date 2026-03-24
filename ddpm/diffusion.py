@@ -576,11 +576,23 @@ class GaussianDiffusion_Nolatent(nn.Module):
             return self.denoise_fn.module.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
         return self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale)
 
+    def _clip_x0_baseline(self, x_recon):
+        s = 1.
+        if self.use_dynamic_thres:
+            s = torch.quantile(
+                rearrange(x_recon, 'b ... -> b (...)').abs(),
+                self.dynamic_thres_percentile,
+                dim=-1
+            )
+            s.clamp_(min=1.)
+            s = s.view(-1, *((1,) * (x_recon.ndim - 1)))
+        return x_recon.clamp(-s, s) / s
+
     def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
         noise = self._predict_noise(x, t, cond=cond, cond_scale=cond_scale)
         x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
         if clip_denoised:
-            x_recon = clamp_joint_x0(x_recon)
+            x_recon = self._clip_x0_baseline(x_recon)
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t)
         return model_mean, posterior_variance, posterior_log_variance
@@ -635,6 +647,16 @@ class GaussianDiffusion_Nolatent(nn.Module):
         for i in range(self.num_timesteps - 1, -1, -1):
             timestep = torch.full((b,), i, dtype=torch.long, device=device)
             sample = self._apply_guidance(sample, image, timestep)
+            sample = self.p_sample(sample, timestep, cond=cond, cond_scale=cond_scale)
+        return sample
+
+    @torch.inference_mode()
+    def p_sample_loop_ddpm(self, shape_image, shape_mask, cond=None, cond_scale=1., device=None):
+        b = shape_image[0]
+        sample = self._init_joint_sample(shape_image, shape_mask, device)
+
+        for i in range(self.num_timesteps - 1, -1, -1):
+            timestep = torch.full((b,), i, dtype=torch.long, device=device)
             sample = self.p_sample(sample, timestep, cond=cond, cond_scale=cond_scale)
         return sample
 
@@ -751,17 +773,12 @@ class GaussianDiffusion_Nolatent(nn.Module):
                     image=image,
                 )
             if guidance_mode == 'none':
-                return self.sample_loop_ddim(
+                return self.p_sample_loop_ddpm(
                     shape_image=shape_image,
                     shape_mask=shape_mask,
                     cond=cond,
                     cond_scale=cond_scale,
                     device=device,
-                    image=None,
-                    ddim_steps=self.num_timesteps,
-                    eta=1.0,
-                    guidance_mode='none',
-                    guidance_cfg=guidance_cfg,
                 )
             raise ValueError(f"Unsupported ddpm guidance mode: {guidance_mode}")
 
@@ -807,17 +824,12 @@ class GaussianDiffusion_Nolatent(nn.Module):
                 device=device,
                 image=image,
             )
-        return self.sample_loop_ddim(
+        return self.p_sample_loop_ddpm(
             shape_image=shape_image,
             shape_mask=shape_mask,
             cond=cond,
             cond_scale=cond_scale,
             device=device,
-            image=None,
-            ddim_steps=self.num_timesteps,
-            eta=1.0,
-            guidance_mode='none',
-            guidance_cfg=None,
         )
 
     def q_sample(self, x_start, t, noise=None):

@@ -98,7 +98,9 @@ class MMWHS_Dataset(Dataset):
             'affine': affine
         }
 
-def get_MMWHS_dataloader(root_dir, data_type, mode, batch_size=1, drop_last=False):
+def get_MMWHS_dataloader(root_dir, data_type, mode, batch_size=1, drop_last=False, num_workers=None):
+    if num_workers is None:
+        num_workers = int(os.environ.get("DIFFATLAS_NUM_WORKERS", "20"))
     dataset = MMWHS_Dataset(root_dir=root_dir, data_type=data_type, mode=mode)
     if mode == 'train':
         shuffle = True
@@ -108,6 +110,6 @@ def get_MMWHS_dataloader(root_dir, data_type, mode, batch_size=1, drop_last=Fals
     else:
         raise ValueError('No Such Mode')
     loader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=20, pin_memory=True, drop_last=drop_last
+        dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True, drop_last=drop_last
     )
     return loader
